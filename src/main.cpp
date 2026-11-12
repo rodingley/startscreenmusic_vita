@@ -376,7 +376,8 @@ void musicCommand(uint32_t cmd) {
 // polls (1 s) could see a half-written copy; the UI reads in microseconds.
 struct Now {
     int state;  // the service's play status: 1 playing, 2 paused (0 none, 10 nothing to play)
-    bool loaded;  // a song, in a running Music app
+    bool loaded;  // a song in the shell's music player
+    bool shown;   // the panel shows, as the quick menu's Music row would
     char title[256], artist[256];  // empty: Sony's "Unknown"
 };
 Now g_now[2];
@@ -385,26 +386,20 @@ volatile int g_nowSeq;  // bumped on every change
 
 Track g_track;  // the music thread's
 
+// The Music app's LiveArea (watched further down): open, and whether it can be
+// watched at all (if not, the panel shows whenever the player has a song).
+volatile bool g_musicLiveArea;
+volatile bool g_liveAreaWatched;
+
 void copyStr(char* d, const char* s, int n) {
     sceClibStrncpy(d, s, n - 1);
     d[n - 1] = 0;
 }
 
-// The Music app (NPXS10009) running: the service keeps the last song's
-// title and a paused state after the app is closed (seen in testing).
-// _sceAppMgrGetIdByName(pid out, title id, options), from src/appmgr_stub.S.
-extern "C" int ssm_sceAppMgrGetIdByName(SceUID* pid, const char* name, const void* opt);
-
-bool musicAppRunning() {
-    SceUID pid = -1;
-    const uint32_t opt[2] = {0, 0};  // SceAppMgrGetIdByNameOpt: ignored on 3.60+
-    return ssm_sceAppMgrGetIdByName(&pid, "NPXS10009", opt) >= 0 && pid >= 0;
-}
-
 // The music and cover threads sleep until there is something to do: these
 // wake them (a press or a new start screen; a new song or a cover taken).
 SceUID g_wakeMusic = -1, g_wakeCover = -1;
-volatile bool g_forgetCovers;  // the Music app closed: its remembered covers can go
+volatile bool g_forgetCovers;  // the song went from the music player: its remembered covers can go
 volatile int g_fastPolls;      // after a press: look every 50 ms for a moment
 void wake(SceUID sema) {
     if (sema >= 0) sceKernelSignalSema(sema, 1);  // already awake: refused, harmlessly
@@ -428,25 +423,21 @@ void pollMusic() {
     const Now& was = g_now[g_nowIdx];
     Now& n = g_now[g_nowIdx ^ 1];
     n.state = rcS >= 0 ? (int)st[0x10 / 4] : 0;
-    // Whether the Music app runs: looked at once a second, or when the state
-    // changes.
-    static bool app;
-    static SceInt64 appAt;
-    const SceInt64 now = sceKernelGetProcessTimeWide();
-    if (now >= appAt || n.state != was.state) {
-        const bool had = app;
-        app = musicAppRunning();
-        appAt = now + 1000000;
-        if (had && !app) {
-            g_forgetCovers = true;
-            wake(g_wakeCover);
-        }
-    }
-    // The song (6 KB from the service) only when there is one to show.
+    // The song (6 KB from the service) only when the player has one.
     int rcT = -1;
     sceClibMemset(&g_track, 0, sizeof(g_track));
-    if (app && (n.state == 1 || n.state == 2)) rcT = svcCall(0x3001B, &in, 1, &g_track, sizeof(g_track));
-    n.loaded = app && rcT >= 0 && (n.state == 1 || n.state == 2);
+    if (n.state == 1 || n.state == 2) rcT = svcCall(0x3001B, &in, 1, &g_track, sizeof(g_track));
+    n.loaded = rcT >= 0 && (n.state == 1 || n.state == 2);
+    // The panel shows when the quick menu's Music row does (seen on 3.65):
+    // while music plays, and while the player has a song and the Music app's
+    // LiveArea is open, the app running or not, wherever the music was
+    // started. Closing the LiveArea stops the music and the row goes; it
+    // comes back when the LiveArea opens again.
+    n.shown = n.loaded && (n.state == 1 || g_musicLiveArea || !g_liveAreaWatched);
+    if (was.loaded && !n.loaded) {  // the player has no song now
+        g_forgetCovers = true;
+        wake(g_wakeCover);
+    }
     copyStr(n.title, n.loaded ? g_track.title : "", sizeof(n.title));
     copyStr(n.artist, n.loaded ? g_track.artist : "", sizeof(n.artist));
 
@@ -464,7 +455,7 @@ void pollMusic() {
         wake(g_wakeCover);
     }
 
-    if (n.state == was.state && n.loaded == was.loaded && !sceClibStrcmp(n.title, was.title) &&
+    if (n.state == was.state && n.loaded == was.loaded && n.shown == was.shown && !sceClibStrcmp(n.title, was.title) &&
         !sceClibStrcmp(n.artist, was.artist))
         return;
     g_nowIdx ^= 1;
@@ -1291,10 +1282,16 @@ int coverThread(SceSize, void*) {
         if (g_reqSeq != seq) continue;
         done = seq;
         CoverMail m = {COVER_SAME, -1, NULL, 0};
-        if (!w.album[0] || !sameText(w.album, last.album) || !sameText(w.artist, last.artist)) {
-            m = findCover(w);
-            last = w;
+        const bool newAlbum = !w.album[0] || !sameText(w.album, last.album) || !sameText(w.artist, last.artist);
+        if (newAlbum) m = findCover(w);
+        // A song skipped while its cover was being looked for: the cover is
+        // dropped, so it never shows, and the newer song's is looked for next
+        // (its request has already woken this thread).
+        if (g_reqSeq != seq) {
+            if (m.uid >= 0) ssm_sceKernelFreeMemBlock(m.uid);
+            continue;
         }
+        if (newAlbum) last = w;
         g_mail = m;
         __sync_synchronize();
         g_mailSeq = seq;
@@ -1341,7 +1338,7 @@ paf::ui::Widget *g_groups[2], *g_titleLine, *g_artistLine, *g_playIcon, *g_pause
 paf::ui::SlideBar* g_bar;
 uint32_t g_barVtable;  // checked before each write, as a second guard
 int g_shownSeq = -1;   // the music state the panel shows
-bool g_panelShown;     // a song is loaded: the panel is shown and takes taps
+bool g_panelShown;     // the panel is shown and takes taps
 int g_playState;       // what the play button does: pause while 1
 int g_coverShows;      // the picture on g_cover: 0 the note, else g_uiCover.id
 
@@ -1452,11 +1449,12 @@ paf::graph::Surface* loadImage(const char* what, const void* data, uint32_t size
     int from = -1;
     paf::graph::Surface* s = loadFile(file, from);
     pinned = !dropFile(file);
-    if (!s) logLine("%s: not loaded (no room in either texture pool)", what);
     return s;
 }
 
 const int kShowNote = 0, kShowJacket = -1;  // g_coverShows, besides a cover's id
+const int kCoverRetries = 10;  // UI ticks a picture is tried again when the pool is full
+int g_coverRetries;
 
 // A picture on the cover square, drawn kCoverUnits wide whatever its own
 // size (a plane draws its texture at the texture's size; its scale sets how
@@ -1482,11 +1480,28 @@ int coverWant() {
     return kShowNote;
 }
 
+// The quick menu's note on the square, at its own 80 x 80, in the theme's colour.
+void showNote() {
+    if (g_noteTex) giveTexture(g_cover, g_noteTex);
+    setScale(g_cover, 1);
+    sceClibMemcpy(g_coverRgb, g_tint, sizeof(g_coverRgb));
+    g_coverShows = kShowNote;
+}
+
 // Puts what is wanted on the square; a picture that won't load falls to the
 // next. The jacket is loaded each time it is wanted and goes with the start
-// screen, as covers do: the texture pool has little room.
+// screen, as covers do: the texture pool has little room. A picture on the
+// square keeps its room in the pool (64 KB: about one cover) until it is let
+// go, and PAF lets it go a moment later: so the note goes up first and the
+// next picture comes on a later tick (on 3.65, loading it at once failed
+// whenever a picture was up). A picture that still won't load is tried again
+// for a few ticks before the square falls to the next choice.
 void swapCover() {
     int want = coverWant();
+    if (want != kShowNote && g_coverShows != kShowNote && g_noteTex) {
+        showNote();
+        return;
+    }
     if (want > 0) {
         bool pinned = false;
         paf::graph::Surface* s = loadImage("cover", g_uiCover.data, g_uiCover.size, pinned);
@@ -1495,8 +1510,12 @@ void swapCover() {
             showPicture(s);
             g_coverRgb[0] = g_coverRgb[1] = g_coverRgb[2] = 1;
             g_coverShows = want;
+            g_coverRetries = 0;
             return;
         }
+        if (++g_coverRetries < kCoverRetries) return;
+        g_coverRetries = 0;
+        logLine("cover: not loaded (no room in either texture pool)");
         g_uiCover.failed = true;
         freeUiCover();
         want = coverWant();
@@ -1508,15 +1527,15 @@ void swapCover() {
             showPicture(j);
             sceClibMemcpy(g_coverRgb, g_tint, sizeof(g_coverRgb));
             g_coverShows = kShowJacket;
+            g_coverRetries = 0;
             return;
         }
+        if (++g_coverRetries < kCoverRetries) return;
+        g_coverRetries = 0;
         g_jacketFailed = true;
         logLine("jacket: not loaded: the note");
     }
-    if (g_noteTex) giveTexture(g_cover, g_noteTex);
-    setScale(g_cover, 1);  // the note at its own 80 x 80
-    sceClibMemcpy(g_coverRgb, g_tint, sizeof(g_coverRgb));
-    g_coverShows = kShowNote;
+    showNote();
 }
 
 // The cover square, every UI tick while the panel is up.
@@ -1604,12 +1623,12 @@ void applyMusic() {
     g_shownSeq = g_nowSeq;
     const Now& n = g_now[g_nowIdx];
     g_playState = n.state;
-    if (n.loaded != g_panelShown) {
-        show(g_groups[0], n.loaded);
-        show(g_groups[1], n.loaded);
-        g_panelShown = n.loaded;
+    if (n.shown != g_panelShown) {
+        show(g_groups[0], n.shown);
+        show(g_groups[1], n.shown);
+        g_panelShown = n.shown;
     }
-    if (!n.loaded) return;
+    if (!n.shown) return;
     if (g_titleLine) {
         if (n.title[0]) setLine(g_titleLine, 0, n.title);
         else setLineW(g_titleLine, 0, sonyString(kUnknown));
@@ -1894,6 +1913,67 @@ void tick(void*) {
     if (g_panelShown && !g_dragging && sceAVConfigGetSystemVol(&vol) >= 0) showVolume(vol);
 }
 
+// ── The Music LiveArea ──────────────────────────────────────────────────────
+// SceShell opens an app's LiveArea by loading the PAF plugin
+// "livearea_template_<title ID>" and closes it by unloading it (seen on 3.65;
+// the Music app is NPXS10009). Its calls to PAF's Plugin::LoadAsync,
+// LoadSync and UnloadAsync are watched for that name and passed on unchanged.
+const char kMusicLiveArea[] = "livearea_template_NPXS10009";
+
+struct LiveAreaHook {
+    uint32_t nid;
+    tai_hook_ref_t ref;
+};
+LiveAreaHook g_laHooks[4] = {
+    {0xF702E40A, 0},  // static Plugin::LoadAsync(InitParam const&, ...)
+    {0xBE479650, 0},  // static Plugin::LoadSync(InitParam const&, ...)
+    {0x664A8AB3, 0},  // static Plugin::UnloadAsync(const char* name, ...)
+    {0x1ADB3A22, 0},  // static Plugin::UnloadAsync(Plugin*, ...)
+};
+
+bool inUserMemory(uint32_t v) { return v >= 0x80000000u && v < 0xA0000000u; }
+
+void noteLiveArea(int i, uint32_t a0) {
+    if (i == 2 ? !inUserMemory(a0) : !looksLikePointer(a0)) return;
+    const char* name = i <= 1 ? ((const paf::Plugin::InitParam*)a0)->name.c_str()
+                       : i == 2 ? (const char*)a0
+                                : ((const paf::Plugin*)a0)->GetName();
+    if (!inUserMemory((uint32_t)name) || sceClibStrncmp(name, kMusicLiveArea, sizeof(kMusicLiveArea))) return;
+    const bool open = i <= 1;
+    if (open == g_musicLiveArea) return;
+    g_musicLiveArea = open;
+    g_pollSoon = true;  // the panel follows at once
+    wake(g_wakeMusic);
+}
+
+// Six words passed on: enough for each of these (extra ones are read from the
+// caller's stack and ignored).
+#define LIVEAREA_HOOK(i)                                                                                         \
+    uint32_t liveAreaHook##i(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5) {     \
+        typedef uint32_t (*F)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);                       \
+        noteLiveArea(i, a0);                                                                                     \
+        const _tai_hook_user* cur = (const _tai_hook_user*)g_laHooks[i].ref;                                     \
+        const _tai_hook_user* next = (const _tai_hook_user*)cur->next;                                           \
+        return next ? ((F)next->func)(a0, a1, a2, a3, a4, a5) : ((F)cur->old)(a0, a1, a2, a3, a4, a5);           \
+    }
+LIVEAREA_HOOK(0)
+LIVEAREA_HOOK(1)
+LIVEAREA_HOOK(2)
+LIVEAREA_HOOK(3)
+
+// Once ScePaf has loaded: SceShell's imports from it resolve only then.
+void watchLiveAreas() {
+    const void* fns[4] = {(const void*)liveAreaHook0, (const void*)liveAreaHook1, (const void*)liveAreaHook2,
+                          (const void*)liveAreaHook3};
+    unsigned hooked = 0;
+    for (int i = 0; i < 4; i++)
+        if (taiHookFunctionImport(&g_laHooks[i].ref, "SceShell", 0x4D9A9DD0, g_laHooks[i].nid, fns[i]) >= 0)
+            hooked |= 1u << i;
+    g_liveAreaWatched = (hooked & 3) && (hooked & 12);  // something to see it open and close
+    if (!g_liveAreaWatched)
+        logLine("Music LiveArea not watched (0x%X): the panel shows whenever there is a song", hooked);
+}
+
 int mainThread(SceSize, void*) {
     // ScePaf loads after the shell's plugins start.
     for (int waited = 0; !findPafText(); waited++) {
@@ -1908,6 +1988,7 @@ int mainThread(SceSize, void*) {
     // wait it booted every time.
     sceKernelDelayThread(5 * 1000 * 1000);
     if (!findPaf()) return 0;
+    watchLiveAreas();
     ((RegisterFn)g_paf[PAF_REGISTER].fn)(tick, NULL);
     const char* const mods[2] = {"SceShellSvc", "SceShellUtil"};
     for (int i = 0; i < 2 && !g_svc; i++) {

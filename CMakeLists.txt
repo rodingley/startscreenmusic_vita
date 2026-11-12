@@ -7,12 +7,12 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "toolchain")
 endif()
 
-project(StartScreenMusic VERSION 1.0 LANGUAGES C CXX ASM)
+project(StartScreenMusic VERSION 1.0.1 LANGUAGES C CXX ASM)
 include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 add_executable(startscreenmusic src/main.cpp src/cover_image.cpp src/updater.cpp third_party/picojpeg/picojpeg.c
     third_party/uzlib/tinflate.c third_party/uzlib/adler32.c third_party/uzlib/crc32.c
-    src/appmgr_stub.S src/sysmem_stub.S)
+    src/sysmem_stub.S)
 target_include_directories(startscreenmusic PRIVATE third_party/paf/include third_party/picojpeg third_party/uzlib)
 # No C runtime inside SceShell; PAF's 16-bit wchar_t; no static constructors.
 target_compile_options(startscreenmusic PRIVATE

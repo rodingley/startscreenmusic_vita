@@ -4,7 +4,7 @@ Music controls on the PS Vita's start screen (lock screen), built from the Vita'
 
 ![Start Screen Music on the PS Vita's start screen](images/start_screen.png)
 
-While a song is playing or paused in the Music app, the start screen shows the song's cover, title and artist, a volume bar, and previous / play / next. It is the Quick Menu's own Music row, laid out above the clock. Like the clock, it is simply there when the screen lights up, and a new song's title and cover replace the old ones the way the Quick Menu's do. When the Music app closes, it goes.
+While a song is playing, or paused with the Music app or its LiveArea open, the start screen shows the song's cover, title and artist, a volume bar, and previous / play / next: whenever the Quick Menu shows its Music row, wherever the music was started. It is the Quick Menu's own Music row, laid out above the clock. Like the clock, it is simply there when the screen lights up, and a new song's title and cover replace the old ones the way the Quick Menu's do. When the Music LiveArea closes, it goes.
 
 Everything on it is Sony's, read from the Vita while it runs; nothing of Sony's ships with the plugin:
 
@@ -12,6 +12,19 @@ Everything on it is Sony's, read from the Vita while it runs; nothing of Sony's 
 - "Unknown" for a song without a title or artist: the Quick Menu's own string, in all 20 of the Vita's languages;
 - the square for a song without a cover: the Music app's own (`vs0:app/NPXS10009/musicbrowser_plugin.rco`);
 - the layout: the start screen's own margins (the cover's left edge on the speaker line, and 16 px from the top: the gap the clock keeps at the bottom), and the theme's clock colour.
+
+### PS Vita universal
+
+It works like one of the Vita's own features:
+
+- Every language: Sony's own words, in your system language; titles and artists in any script.
+- Every theme: in your theme's clock colour.
+- Part of the start screen: it fades with the clock when you peel the screen.
+- Long titles scroll, like the Quick Menu's.
+- Volume by touch: drag the bar.
+- Covers at once: a song played before shows its cover straight away, even after a restart.
+- No slowdown: the Vita starts as fast as before.
+- Music from anywhere: the Music app, its LiveArea or the Quick Menu.
 
 ## Download and install
 
@@ -51,6 +64,17 @@ In `ur0:tai/`:
 
 In `ux0:data/startscreenmusic/covers/`: the small covers. The folder can be deleted at any time; covers are simply made again.
 
+### Testing and reporting a problem
+
+Start Screen Music is tested on a PCH-1000 with 3.65. Reports from 3.60, 3.67 to 3.74, the PCH-2000 and the PS TV help most.
+
+1. Play a song, lock the Vita with the power button and wake it: the song, its cover and the buttons should show. Take a screenshot (PS + START).
+2. Try previous, pause, play, next and the volume bar.
+3. Close the Music app, open its LiveArea again and start the music from its play button, then lock and wake the Vita: the panel should show. Close the LiveArea: the panel should go.
+4. Peel the start screen open: there should be no sound and no crash.
+
+Send your model, your firmware (Settings > System > System Information), your screenshots, and `ur0:tai/startscreenmusic_log.txt` and `ur0:tai/startscreenmusic_log_prev.txt` in a [GitHub issue](../../issues), or on Discord to `rodingley`.
+
 ## Building from source
 
 You need [VitaSDK](https://vitasdk.org) with taiHEN's stubs (`vdpm install taihen`). The PAF headers aren't in this repository (see Credits and licences); fetch them once:
@@ -83,10 +107,10 @@ The auto-updater reads the latest release's tag and downloads `release/startscre
 
 | File | What it does |
 | --- | --- |
-| `src/main.cpp` | Hooks the start screen, builds the panel from the Quick Menu's Music row, follows the Music app, and finds, keeps and saves each song's cover |
+| `src/main.cpp` | Hooks the start screen, builds the panel from the Quick Menu's Music row, follows the music player and the Music LiveArea, and finds, keeps and saves each song's cover |
 | `src/cover_image.cpp` | Turns a JPEG or PNG cover into a small 120 px picture, a little at a time |
 | `src/updater.cpp`, `src/update_certs.h` | The auto-updater: checks GitHub, downloads a new version and puts it in place |
-| `src/appmgr_stub.S`, `src/sysmem_stub.S` | System functions the plugin calls that VitaSDK doesn't link for plugins |
+| `src/sysmem_stub.S` | System functions the plugin calls that VitaSDK doesn't link for plugins |
 | `tools/get_paf.sh` | Fetches the PAF headers |
 | `tools/fetch_log.sh` | `make log`: brings back the log and screenshots |
 | `tools/rco_dump.py` | Reads the Vita's RCO resource files |
