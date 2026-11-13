@@ -46,6 +46,8 @@ To remove it, delete that line and restart (and the `ux0:data/startscreenmusic` 
 
 The plugin keeps itself up to date. Once a boot, two minutes after the Vita starts, it asks this repository for its latest release (if Wi-Fi isn't connected yet, it waits for it). When there is a newer version, it downloads it in the background and puts it in place of the old one; the new version starts with the next restart. There is no pop-up and nothing to press.
 
+To update straight away: restart the Vita, keep it on Wi-Fi for 3 minutes, then restart it again.
+
 If a check is ever cut short three times (the Vita turned off during it, say), that version stops checking, so an update can never get in the way of starting the Vita.
 
 ### Covers
