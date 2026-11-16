@@ -7,8 +7,9 @@
  * needed 4.5 MB). So a JPEG is decoded here a block at
  * a time with picojpeg, each pixel added straight into its cell of a small
  * square, and the square written as a plain PNG, which PAF loads from memory.
- * Pictures 1024 pixels or bigger are read at 1/8 size (picojpeg's reduce
- * mode, one pixel per block), which is still more than the square needs.
+ * Pictures at least eight times the square's side (960 pixels for the
+ * 120 square) are read at 1/8 size (picojpeg's reduce mode, one pixel per
+ * block), which is still at least the square.
  * A PNG is unpacked a row at a time the same way (uzlib's streaming inflate,
  * 32 KB of window). Progressive JPEGs and interlaced PNGs are not read (the
  * jacket shows instead).
@@ -326,7 +327,7 @@ uint32_t coverToPng(const uint8_t* data, uint32_t size, uint8_t* work, uint32_t 
     info->width = jpg.m_width;
     info->height = jpg.m_height;
     // Big pictures at 1/8 size: one pixel for each 8 x 8 block.
-    const bool reduce = (jpg.m_width < jpg.m_height ? jpg.m_width : jpg.m_height) >= 1024;
+    const bool reduce = (jpg.m_width < jpg.m_height ? jpg.m_width : jpg.m_height) >= 8 * maxSide;
     if (reduce) {
         src.pos = 0;
         rc = pjpeg_decode_init(&jpg, feed, &src, 1);

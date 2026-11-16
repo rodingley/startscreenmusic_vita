@@ -29,6 +29,7 @@ mkdir -p "$shots"
 last=$(cat "$shots/.last" 2>/dev/null || date -v-3H +%Y-%m-%d-%H%M%S)
 newest="$last"
 count=0
+failed=""
 names() { curl --fail -sS "$1" | tr -d '\r' | awk -v want="$2" 'substr($1, 1, 1) == want { print $NF }'; }
 for dir in $(names "$base/ux0:/picture/SCREENSHOT/" d); do
     for file in $(names "$base/ux0:/picture/SCREENSHOT/$dir/" -); do
@@ -38,11 +39,21 @@ for dir in $(names "$base/ux0:/picture/SCREENSHOT/" d); do
                 count=$((count + 1))
                 curl --fail -sS -o /dev/null -Q "DELE /ux0:/picture/SCREENSHOT/$dir/$file" "$base/" ||
                     echo "Couldn't delete $file from the Vita"
+                if expr "$stamp" \> "$newest" > /dev/null; then newest="$stamp"; fi
+            else
+                rm -f "$shots/$file"
+                failed="$failed $file"
             fi
-            if expr "$stamp" \> "$newest" > /dev/null; then newest="$stamp"; fi
         fi
     done
 done
+if [ -n "$failed" ]; then
+    echo "Couldn't bring back:$failed (still on the Vita; make log tries again)"
+    first=$(echo $failed | tr ' ' '\n' | sort | head -1)
+    first="${first%.*}"
+    # .last stays just before the first that failed
+    if expr "$newest" \>= "$first" > /dev/null; then newest="$last"; fi
+fi
 echo "$newest" > "$shots/.last"
 
 # Files on the Vita to delete, one path a line (ux0:..., ur0:...), listed in

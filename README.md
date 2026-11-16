@@ -4,25 +4,29 @@ Music controls on the PS Vita's start screen (lock screen), built from the Vita'
 
 ![Start Screen Music on the PS Vita's start screen](images/start_screen.png)
 
-While a song is playing, or paused with the Music app or its LiveArea open, the start screen shows the song's cover, title and artist, a volume bar, and previous / play / next: whenever the Quick Menu shows its Music row, wherever the music was started. It is the Quick Menu's own Music row, laid out above the clock. Like the clock, it is simply there when the screen lights up, and a new song's title and cover replace the old ones the way the Quick Menu's do. When the Music LiveArea closes, it goes.
+While a song is playing, or paused with the Music app or its LiveArea open, the start screen shows the song's cover, title, artist and time, a volume bar, and previous / play / next: whenever the Quick Menu shows its Music row, wherever the music was started. It is the Quick Menu's own Music row, laid out on the start screen with the clock. Like the clock, it is simply there when the screen lights up, and a new song's title and cover replace the old ones the way the Quick Menu's do. When the Music LiveArea closes, it goes.
 
 Everything on it is Sony's, read from the Vita while it runs; nothing of Sony's ships with the plugin:
 
 - the buttons, icons, volume bar and text styles: the Quick Menu's Music row (`vs0:vsh/shell/impose_plugin.rco`), in the system font;
 - "Unknown" for a song without a title or artist: the Quick Menu's own string, in all 20 of the Vita's languages;
 - the square for a song without a cover: the Music app's own (`vs0:app/NPXS10009/musicbrowser_plugin.rco`);
-- the layout: the start screen's own margins (the cover's left edge on the speaker line, and 16 px from the top: the gap the clock keeps at the bottom), and the theme's clock colour.
+- the glass behind it: the frame Sony draws round the start screen's notifications and the filled box made for it, both from `vs0:vsh/shell/power_manage_plugin.rco`;
+- the song's time: played / length, as the Music app shows it;
+- the layout: the start screen's own margins (the cover's left edge on the speaker line, and 16 px from the edge: the gap the clock keeps), and the theme's clock colour.
+
+It always sits on the left, in line with the clock: top left, or bottom left when the theme puts the clock top left or bottom right.
 
 ### PS Vita universal
 
 It works like one of the Vita's own features:
 
 - Every language: Sony's own words, in your system language; titles and artists in any script.
-- Every theme: in your theme's clock colour.
-- Part of the start screen: it fades with the clock when you peel the screen.
+- Every theme: in your theme's clock colour, on dark glass that keeps it readable on any wallpaper, and out of the clock's way wherever the theme puts it.
+- Part of the start screen: it fades with the clock when you peel the screen, and its buttons work while a notification shows.
 - Long titles scroll, like the Quick Menu's.
-- Volume by touch: drag the bar.
-- Covers at once: a song played before shows its cover straight away, even after a restart.
+- Volume by touch: drag the bar. It follows your finger and settles on the nearest step when you let go, like the Quick Menu's.
+- Covers at once: every song shows its cover straight away, even the first time it plays.
 - No slowdown: the Vita starts as fast as before.
 - Music from anywhere: the Music app, its LiveArea or the Quick Menu.
 
@@ -54,7 +58,7 @@ If a check is ever cut short three times (the Vita turned off during it, say), t
 
 From the song's file in `ux0:music`: an MP3's ID3 picture, or an M4A / MP4's cover. SceShell has about 1 MB of memory free, so each cover is decoded a little at a time and made a 120 px square (it shows at 110 px). It is prepared as the song starts, at the lowest priority, and shows the moment the start screen lights up. JPEG and PNG covers both work; progressive JPEGs and interlaced PNGs show the no-cover square.
 
-Like the Vita's own media apps, the plugin keeps each small cover on the memory card, so a song played before shows its cover at once, even after a restart. A song whose file has changed has its cover made again, and once there are 300 covers (about 13 MB) the oldest go.
+Like the Vita's own media apps, the plugin keeps the small covers on the memory card, one for each album, so a song shows its cover at once, even after a restart. As the Music app does, it looks for new songs when the Music LiveArea opens and makes their covers in the background, so even a song's first play shows its cover straight away. A song whose file has changed has its cover made again, and once there are 300 covers (about 13 MB) the oldest go.
 
 ### Files on the Vita
 
@@ -64,7 +68,7 @@ In `ur0:tai/`:
 - `startscreenmusic_log.txt` (and `_log_prev.txt`, the boot before): one line a song, the update check, and anything that went wrong;
 - `startscreenmusic_update.txt`: the update check's notes (which version, how many checks were cut short, the last version installed).
 
-In `ux0:data/startscreenmusic/covers/`: the small covers. The folder can be deleted at any time; covers are simply made again.
+In `ux0:data/startscreenmusic/`: the small covers (`covers/`) and the list of songs already looked at (`library.bin`). The folder can be deleted at any time; covers are simply made again.
 
 ### Testing and reporting a problem
 
@@ -74,6 +78,7 @@ Start Screen Music is tested on a PCH-1000 with 3.65. Reports from 3.60, 3.67 to
 2. Try previous, pause, play, next and the volume bar.
 3. Close the Music app, open its LiveArea again and start the music from its play button, then lock and wake the Vita: the panel should show. Close the LiveArea: the panel should go.
 4. Peel the start screen open: there should be no sound and no crash.
+5. With a theme that puts the clock somewhere else, the panel should sit on the left, out of the clock's way.
 
 Send your model, your firmware (Settings > System > System Information), your screenshots, and `ur0:tai/startscreenmusic_log.txt` and `ur0:tai/startscreenmusic_log_prev.txt` in a [GitHub issue](../../issues), or on Discord to `rodingley`.
 
@@ -109,7 +114,7 @@ The auto-updater reads the latest release's tag and downloads `release/startscre
 
 | File | What it does |
 | --- | --- |
-| `src/main.cpp` | Hooks the start screen, builds the panel from the Quick Menu's Music row, follows the music player and the Music LiveArea, and finds, keeps and saves each song's cover |
+| `src/main.cpp` | Hooks the start screen, builds the panel from the Quick Menu's Music row and places it by the theme's clock, follows the music player and the Music LiveArea, and finds, keeps, saves and makes ahead each album's cover |
 | `src/cover_image.cpp` | Turns a JPEG or PNG cover into a small 120 px picture, a little at a time |
 | `src/updater.cpp`, `src/update_certs.h` | The auto-updater: checks GitHub, downloads a new version and puts it in place |
 | `src/sysmem_stub.S` | System functions the plugin calls that VitaSDK doesn't link for plugins |

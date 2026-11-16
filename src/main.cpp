@@ -57,6 +57,12 @@
 #define LOG_PREV "ur0:tai/startscreenmusic_log_prev.txt"
 
 // No C runtime in SceShell: what the compiler may call, from the kernel's.
+// The plugin's code ends just short of 64 KB, where the linker starts its
+// data, and vita-elf-create needs about 1 KB after the code for the module's
+// own tables ("segment 1 overlaps"). These 2 KB of nothing take the code
+// past 64 KB, so the data starts at 128 KB with room to spare.
+__attribute__((used)) const uint8_t kCodePad[2048] = {1};
+
 extern "C" void* memcpy(void* d, const void* s, size_t n) { return sceClibMemcpy(d, s, n); }
 extern "C" void* memset(void* d, int c, size_t n) { return sceClibMemset(d, c, n); }
 extern "C" int memcmp(const void* a, const void* b, size_t n) { return sceClibMemcmp(a, b, n); }
@@ -127,9 +133,15 @@ PafFn g_pafOpt[] = {
     {"Surface::Load", 0xA070D6A7, 0xB228A257, 0},  // ScePafGraphics, from a File
     {"compress::Decompress", 0x3D643CE8, 0x5E39FCE1, 0},  // ScePafMisc, zlib
     {"gutil::GetDefaultSurfacePool", 0xA070D6A7, 0xCDE30B64, 0},
+    {"Plugin::GetTexture", 0x4D9A9DD0, 0x38FFFE8E, 0},      // for the glass
+    {"PlaneObj::SetScaleMode", 0xA070D6A7, 0x14F2FA80, 0},  // ScePafGraphics
+    {"Widget::SetRot", 0x073F8C68, 0xF50BF15B, 0},
+    {"Text::SetStyleAttribute", 0x073F8C68, 0xCD20EF38, 0},  // the v4 one: a colour
+    {"Text::GetStyleAttribute", 0x073F8C68, 0xF3281F1C, 0},  // the v4 one
 };
 enum {
-    OPT_GET_STRING, OPT_MEMFILE_OPEN, OPT_SURFACE_LOAD, OPT_DECOMPRESS, OPT_DEFAULT_POOL
+    OPT_GET_STRING, OPT_MEMFILE_OPEN, OPT_SURFACE_LOAD, OPT_DECOMPRESS, OPT_DEFAULT_POOL, OPT_GET_TEXTURE,
+    OPT_SCALE_MODE, OPT_SET_ROT, OPT_TEXT_STYLE, OPT_TEXT_STYLE_GET
 };
 
 bool findTable(PafFn* t, unsigned n) {
@@ -174,6 +186,11 @@ typedef void (*MemFileOpenFn)(void* ret, const void* data, size_t size, int32_t*
 typedef void (*SurfaceLoadFn)(void* ret, paf::graph::SurfacePool*, void* file, void* option);
 typedef int32_t (*DecompressFn)(void* dst, size_t dstSize, const void* src, size_t srcSize, int type);
 typedef paf::graph::SurfacePool* (*DefaultPoolFn)();
+typedef void (*GetTextureFn)(void* ret, paf::Plugin*, const paf::IDParam&);
+typedef int (*TextStyleFn)(paf::ui::Widget*, int attr, uint32_t from, uint32_t len, const float* v4);
+typedef int (*TextStyleGetFn)(paf::ui::Widget*, int attr, uint32_t index, float* v4);
+typedef int (*SetRotFn)(paf::ui::Widget*, const float*, int, void*, int, int, float, void*, void*);
+typedef void (*ScaleModeFn)(paf::graph::PlaneObj*, int, int);
 
 // An IDParam by hash, laid out like paf::IDParam (its string, empty, then
 // the hash) without constructing one: its string's destructor would import
@@ -215,7 +232,7 @@ struct WStr {
     size_t count;
     uint32_t alloc;
 };
-wchar_t g_lineBuf[2][256];
+wchar_t g_lineBuf[3][256];  // title, artist, the song's time
 
 void showLine(paf::ui::Widget* w, const wchar_t* s, int n) {
     const WStr str = {s, (size_t)n, 0};
@@ -379,6 +396,7 @@ struct Now {
     bool loaded;  // a song in the shell's music player
     bool shown;   // the panel shows, as the quick menu's Music row would
     char title[256], artist[256];  // empty: Sony's "Unknown"
+    int played, length;            // seconds (length 0: not known)
 };
 Now g_now[2];
 volatile int g_nowIdx;
@@ -440,6 +458,10 @@ void pollMusic() {
     }
     copyStr(n.title, n.loaded ? g_track.title : "", sizeof(n.title));
     copyStr(n.artist, n.loaded ? g_track.artist : "", sizeof(n.artist));
+    // How far in, from the same status (milliseconds at 0x2C, as the Music
+    // app reads it); the song's length from the song.
+    n.played = n.loaded ? (int)(st[0x2C / 4] / 1000) : 0;
+    n.length = n.loaded ? (int)(g_track.durationMs / 1000) : 0;
 
     // A new song: its cover is looked for.
     if (n.loaded && (sceClibStrcmp(g_track.title, g_reqLast.title) || sceClibStrcmp(g_track.album, g_reqLast.album) ||
@@ -456,7 +478,7 @@ void pollMusic() {
     }
 
     if (n.state == was.state && n.loaded == was.loaded && n.shown == was.shown && !sceClibStrcmp(n.title, was.title) &&
-        !sceClibStrcmp(n.artist, was.artist))
+        !sceClibStrcmp(n.artist, was.artist) && n.played == was.played && n.length == was.length)
         return;
     g_nowIdx ^= 1;
     g_nowSeq++;
@@ -599,7 +621,7 @@ bool readTag(const char* path, Tag& t, const char* wanted) {
             if (sceIoLseek(fd, dataOff, SCE_SEEK_SET) == (SceOff)dataOff && sceIoRead(fd, g_io, want) == (int)want) {
                 if (text) {
                     id3Text(g_io, want, text, 256);
-                    if (text == t.title && !sameText(t.title, wanted)) break;  // another song
+                    if (text == t.title && wanted && !sameText(t.title, wanted)) break;  // another song
                 } else if (!frameUnsync) {
                     // APIC: encoding, MIME type, picture type, description, picture.
                     const int enc = g_io[0];
@@ -879,13 +901,16 @@ SceInt64 threadCpuTime() {
 
 // ── Covers saved on the memory card ─────────────────────────────────────────
 // Each small cover is also kept in COVER_DIR, as the Vita's own media apps
-// keep ready-made thumbnails, so a song played before shows its cover at
-// once, even after a restart. A file holds the song's path, size and time
-// (a song changed or gone has its cover made again) and the small PNG. The
-// oldest go once there are more than kSavedMax.
+// keep ready-made thumbnails, so a song shows its cover at once, even after a
+// restart. One cover an album, as in the Music app (one a song for a song
+// without an album). A file holds the path, size and time of the song it came
+// from (that song changed or gone, the cover is made again) and the small
+// PNG. The oldest go once there are more than kSavedMax. Covers saved by
+// 1.0.x (".ssc", one a song) are deleted as they are come across.
 #define COVER_DIR "ux0:data/startscreenmusic/covers"
+#define COVER_EXT ".cov"
 const int kSavedMax = 300;  // about 13 MB
-const char kSavedMagic[4] = {'S', 'S', 'M', 'C'};
+const char kSavedMagic[4] = {'S', 'S', 'M', 'D'};
 
 struct SavedHead {  // as written: seven 32-bit words
     char magic[4];
@@ -899,19 +924,52 @@ uint64_t when(const SceDateTime& t) {
            t.microsecond;
 }
 
-// The file for w's cover: two 32-bit hashes of its title, album and artist.
-void savedName(const Want& w, char* out, int cap) {
-    uint32_t a = 2166136261u, b = 0x9747B28Cu;
-    const char* const parts[3] = {w.title, w.album, w.artist};
-    for (int i = 0; i < 3; i++) {
-        for (const char* c = parts[i]; *c; c++) {
-            a = (a ^ (uint8_t)*c) * 16777619u;
-            b = (b ^ (uint8_t)*c) * 0x5BD1E995u;
-        }
-        a = (a ^ 0xFF) * 16777619u;
-        b = (b ^ 0xFF) * 0x5BD1E995u;
+// Text into two hashes, as sameText compares it: case (ASCII) and spaces at
+// either end don't count.
+void hashText(uint32_t& a, uint32_t& b, const char* s) {
+    while (*s == ' ') s++;
+    int n = 0;
+    while (s[n]) n++;
+    while (n && s[n - 1] == ' ') n--;
+    for (int i = 0; i < n; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        a = (a ^ (uint8_t)c) * 16777619u;
+        b = (b ^ (uint8_t)c) * 0x5BD1E995u;
     }
-    sceClibSnprintf(out, cap, COVER_DIR "/%08x%08x.ssc", (unsigned)a, (unsigned)b);
+    a = (a ^ 0xFF) * 16777619u;
+    b = (b ^ 0xFF) * 0x5BD1E995u;
+}
+
+bool blank(const char* s) {
+    while (*s == ' ') s++;
+    return !*s;
+}
+
+// A cover's key: its album and artist, or, without an album, its song and
+// artist.
+void coverKey(const char* title, const char* album, const char* artist, uint32_t& a, uint32_t& b) {
+    a = 2166136261u;
+    b = 0x9747B28Cu;
+    const bool byAlbum = !blank(album);
+    hashText(a, b, byAlbum ? "album" : "song");
+    hashText(a, b, byAlbum ? album : title);
+    hashText(a, b, artist);
+}
+
+// The file for a cover.
+void savedNameOf(const char* title, const char* album, const char* artist, char* out, int cap) {
+    uint32_t a, b;
+    coverKey(title, album, artist, a, b);
+    sceClibSnprintf(out, cap, COVER_DIR "/%08x%08x" COVER_EXT, (unsigned)a, (unsigned)b);
+}
+void savedName(const Want& w, char* out, int cap) { savedNameOf(w.title, w.album, w.artist, out, cap); }
+
+// The key of w's cover, for the covers kept in memory.
+uint32_t albumKey(const Want& w) {
+    uint32_t a, b;
+    coverKey(w.title, w.album, w.artist, a, b);
+    return a ? a : 1;
 }
 
 bool songStat(const char* path, uint64_t& size, uint64_t& time) {
@@ -923,22 +981,38 @@ bool songStat(const char* path, uint64_t& size, uint64_t& time) {
     return true;
 }
 
+// A saved cover's head, read from fd: true when it is whole and the song it
+// came from is unchanged (fd is then at the PNG).
+bool savedHeadFresh(SceUID fd, SavedHead& h, uint32_t cap) {
+    char song[256];
+    if (!(sceIoRead(fd, &h, sizeof(h)) == (int)sizeof(h) && !sceClibMemcmp(h.magic, kSavedMagic, 4) &&
+          h.pngSize >= 8 && h.pngSize <= cap && h.pathLen > 0 && h.pathLen < sizeof(song) &&
+          sceIoRead(fd, song, h.pathLen) == (int)h.pathLen))
+        return false;
+    song[h.pathLen] = 0;
+    uint64_t size = 0, time = 0;
+    return songStat(song, size, time) && size == ((uint64_t)h.songSizeHi << 32 | h.songSizeLo) &&
+           time == ((uint64_t)h.songTimeHi << 32 | h.songTimeLo);
+}
+
+// True when the cover in file name is there and up to date.
+bool savedFresh(const char* name) {
+    const SceUID fd = sceIoOpen(name, SCE_O_RDONLY, 0);
+    if (fd < 0) return false;
+    SavedHead h;
+    const bool fresh = savedHeadFresh(fd, h, pngSize(kCoverSide, kCoverSide, 3));
+    sceIoClose(fd);
+    return fresh;
+}
+
 // w's saved cover into m: true when there is one and its song is unchanged.
 bool loadSaved(const Want& w, CoverMail& m, uint32_t cap) {
-    char name[96], song[256];
+    char name[96];
     savedName(w, name, sizeof(name));
     const SceUID fd = sceIoOpen(name, SCE_O_RDONLY, 0);
     if (fd < 0) return false;
     SavedHead h;
-    bool stale = !(sceIoRead(fd, &h, sizeof(h)) == (int)sizeof(h) && !sceClibMemcmp(h.magic, kSavedMagic, 4) &&
-                   h.pngSize >= 8 && h.pngSize <= cap && h.pathLen > 0 && h.pathLen < sizeof(song) &&
-                   sceIoRead(fd, song, h.pathLen) == (int)h.pathLen);
-    if (!stale) {
-        song[h.pathLen] = 0;
-        uint64_t size = 0, time = 0;
-        stale = !songStat(song, size, time) || size != ((uint64_t)h.songSizeHi << 32 | h.songSizeLo) ||
-                time != ((uint64_t)h.songTimeHi << 32 | h.songTimeLo);
-    }
+    bool stale = !savedHeadFresh(fd, h, cap);
     uint8_t* png = NULL;
     SceUID uid = -1;
     if (!stale) {
@@ -961,20 +1035,28 @@ bool loadSaved(const Want& w, CoverMail& m, uint32_t cap) {
 }
 
 // Deletes the oldest saved covers once there are more than kSavedMax (at
-// most 32 at a time; this runs every 25 covers saved).
-void pruneSaved() {
+// most 32 at a time; this runs every 25 covers saved), and 1.0.x's covers.
+// How many are left.
+int pruneSaved() {
     struct Old {
         uint64_t time;
         char name[24];
     } old[32];
     int olds = 0, count = 0;
     const SceUID d = sceIoDopen(COVER_DIR);
-    if (d < 0) return;
+    if (d < 0) return 0;
     SceIoDirent e;
     while (sceIoDread(d, &e) > 0) {
         int len = 0;
         while (e.d_name[len]) len++;
-        if (len < 5 || len >= (int)sizeof(old[0].name) || sceClibStrcmp(e.d_name + len - 4, ".ssc")) continue;
+        if (len < 5 || len >= (int)sizeof(old[0].name)) continue;
+        if (!sceClibStrcmp(e.d_name + len - 4, ".ssc")) {  // 1.0.x's
+            char path[96];
+            sceClibSnprintf(path, sizeof(path), COVER_DIR "/%s", e.d_name);
+            sceIoRemove(path);
+            continue;
+        }
+        if (sceClibStrcmp(e.d_name + len - 4, COVER_EXT)) continue;
         count++;
         const uint64_t t = when(e.d_stat.st_mtime);
         int slot = olds < 32 ? olds++ : -1;
@@ -998,12 +1080,15 @@ void pruneSaved() {
         sceClibSnprintf(path, sizeof(path), COVER_DIR "/%s", old[oldest].name);
         sceIoRemove(path);
         old[oldest] = old[--olds];
+        count--;
     }
+    return count;
 }
 
-// Keeps w's small cover (its song at songPath) on the memory card. Written
-// beside it, then renamed: a half-written file never takes its name.
-void saveCover(const Want& w, const char* songPath, const uint8_t* png, uint32_t size) {
+// Keeps a small cover (from the song at songPath) on the memory card as file
+// name. Written beside it, then renamed: a half-written file never takes its
+// name.
+void saveCoverAs(const char* name, const char* songPath, const uint8_t* png, uint32_t size) {
     static bool folders;
     static int saved;
     if (!folders) {
@@ -1022,8 +1107,7 @@ void saveCover(const Want& w, const char* songPath, const uint8_t* png, uint32_t
     h.songTimeHi = (uint32_t)(songTime >> 32);
     h.pathLen = 0;
     while (songPath[h.pathLen]) h.pathLen++;
-    char name[96], temp[100];
-    savedName(w, name, sizeof(name));
+    char temp[100];
     sceClibSnprintf(temp, sizeof(temp), "%s.new", name);
     const SceUID fd = sceIoOpen(temp, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
     if (fd < 0) return;
@@ -1038,11 +1122,72 @@ void saveCover(const Want& w, const char* songPath, const uint8_t* png, uint32_t
     }
     if (saved++ % 25 == 0) pruneSaved();
 }
+void saveCover(const Want& w, const char* songPath, const uint8_t* png, uint32_t size) {
+    char name[96];
+    savedName(w, name, sizeof(name));
+    saveCoverAs(name, songPath, png, size);
+}
+
+// The picture of the song at path (where t says it is) made a small PNG in a
+// block of its own: its size (0 for none) and the block (uid, png). Reading
+// the file at SceShell's default priority when raise is set (a song asked
+// for), else all of it at the thread's lowest (covers made ahead).
+const char* g_smallWhy;  // why not, for the log
+uint32_t smallCover(const Tag& t, const char* path, bool raise, SceUID& pngUid, uint8_t*& png, CoverInfo& ci,
+                    int& decodeMs, int& decodeCpuMs) {
+    pngUid = -1;
+    png = NULL;
+    sceClibMemset(&ci, 0, sizeof(ci));
+    decodeMs = decodeCpuMs = 0;
+    g_smallWhy = "";
+    if (t.picSize > kMaxCoverBytes) {
+        g_smallWhy = "too big";
+        return 0;
+    }
+    // The picture as it is in the file.
+    uint8_t *pic = NULL, *work = NULL;
+    const SceUID picUid = allocBlock("StartScreenMusicPicture", t.picSize, &pic);
+    if (picUid < 0) {
+        g_smallWhy = "memory";
+        return 0;
+    }
+    if (raise) searchPriority(true);
+    const SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    bool ok = fd >= 0 && sceIoLseek(fd, t.picOff, SCE_SEEK_SET) == (SceOff)t.picOff;
+    for (uint32_t got = 0; ok && got < t.picSize;) {
+        const int r = sceIoRead(fd, pic + got, t.picSize - got);
+        ok = r > 0;
+        got += ok ? r : 0;
+    }
+    if (fd >= 0) sceIoClose(fd);
+    if (raise) searchPriority(false);
+    // Decoded a block or a row at a time into the small square
+    // (cover_image.cpp): about 115 KB for the square (a PNG's rows and
+    // window more), and its small PNG, kept.
+    const uint32_t pngCap = pngSize(kCoverSide, kCoverSide, 3);
+    const uint32_t workSize = coverWorkSize(kCoverSide, pic, t.picSize);
+    const SceUID workUid = ok ? allocBlock("StartScreenMusicDecode", workSize, &work) : -1;
+    pngUid = workUid >= 0 ? allocBlock("StartScreenMusicCover", pngCap, &png) : -1;
+    uint32_t pngLen = 0;
+    const SceInt64 t1 = sceKernelGetProcessTimeWide(), cpu1 = threadCpuTime();
+    if (pngUid >= 0) pngLen = coverToPng(pic, t.picSize, work, workSize, kCoverSide, png, pngCap, &ci);
+    decodeMs = (int)(sceKernelGetProcessTimeWide() - t1) / 1000;
+    decodeCpuMs = (int)(threadCpuTime() - cpu1) / 1000;
+    if (workUid >= 0) ssm_sceKernelFreeMemBlock(workUid);
+    ssm_sceKernelFreeMemBlock(picUid);
+    if (!pngLen) {
+        g_smallWhy = !ok ? "file" : pngUid < 0 ? "memory" : "picture";
+        if (pngUid >= 0) ssm_sceKernelFreeMemBlock(pngUid);
+        pngUid = -1;
+        png = NULL;
+    }
+    return pngLen;
+}
 
 // The cover of w as a small PNG, or none (the jacket then).
 CoverMail findCover(const Want& w) {
     CoverMail m = {COVER_NONE, -1, NULL, 0};
-    const uint32_t wanted = wantKey(w);
+    const uint32_t wanted = albumKey(w);
     for (int i = 0; i < kRemembered; i++) {
         const Remembered& r = g_remembered[i];
         if (!r.key || r.key != wanted) continue;
@@ -1103,49 +1248,18 @@ CoverMail findCover(const Want& w) {
         remember(wanted, NULL, 0);
         return m;
     }
-    if (g_tag.picSize > kMaxCoverBytes) {
-        logLine("song \"%s\": cover too big (%u bytes)", w.title, (unsigned)g_tag.picSize);
-        return m;
-    }
-    // The picture as it is in the file.
-    uint8_t *pic = NULL, *work = NULL, *png = NULL;
-    const SceUID picUid = allocBlock("StartScreenMusicPicture", g_tag.picSize, &pic);
-    if (picUid < 0) {
-        logLine("song \"%s\": no memory for its cover (%u KB free)", w.title, (unsigned)(freeUserMemory() >> 10));
-        return m;
-    }
-    const SceUID fd = sceIoOpen(g_path, SCE_O_RDONLY, 0);
-    bool ok = fd >= 0 && sceIoLseek(fd, g_tag.picOff, SCE_SEEK_SET) == (SceOff)g_tag.picOff;
-    for (uint32_t got = 0; ok && got < g_tag.picSize;) {
-        const int r = sceIoRead(fd, pic + got, g_tag.picSize - got);
-        ok = r > 0;
-        got += ok ? r : 0;
-    }
-    if (fd >= 0) sceIoClose(fd);
-    searchPriority(false);
-    // Decoded a block or a row at a time into the small square
-    // (cover_image.cpp): about 115 KB for the square (a PNG's rows and
-    // window more), and its small PNG, kept.
-    const uint32_t pngCap = pngSize(kCoverSide, kCoverSide, 3);
-    const uint32_t workSize = coverWorkSize(kCoverSide, pic, g_tag.picSize);
-    const SceUID workUid = ok ? allocBlock("StartScreenMusicDecode", workSize, &work) : -1;
-    const SceUID pngUid = workUid >= 0 ? allocBlock("StartScreenMusicCover", pngCap, &png) : -1;
-    uint32_t pngLen = 0;
+    SceUID pngUid;
+    uint8_t* png;
     CoverInfo ci;
-    sceClibMemset(&ci, 0, sizeof(ci));
-    const SceInt64 t1 = sceKernelGetProcessTimeWide(), cpu1 = threadCpuTime();
-    if (pngUid >= 0)
-        pngLen = coverToPng(pic, g_tag.picSize, work, workSize, kCoverSide, png, pngCap, &ci);
-    const int decodeMs = (int)(sceKernelGetProcessTimeWide() - t1) / 1000;
-    const int decodeCpuMs = (int)(threadCpuTime() - cpu1) / 1000;
-    if (workUid >= 0) ssm_sceKernelFreeMemBlock(workUid);
-    ssm_sceKernelFreeMemBlock(picUid);
+    int decodeMs, decodeCpuMs;
+    const uint32_t pngLen = smallCover(g_tag, g_path, true, pngUid, png, ci, decodeMs, decodeCpuMs);
     if (!pngLen) {
-        logLine("song \"%s\": cover not read (%s, error %d%s, %u KB free)", w.title,
-                !ok ? "file" : pngUid < 0 ? "memory" : "picture", ci.error,
-                ci.error == 37 ? ": progressive JPEG" : ci.error == 100 ? ": interlaced PNG" : "",
-                (unsigned)(freeUserMemory() >> 10));
-        if (pngUid >= 0) ssm_sceKernelFreeMemBlock(pngUid);
+        if (!sceClibStrcmp(g_smallWhy, "too big"))
+            logLine("song \"%s\": cover too big (%u bytes)", w.title, (unsigned)g_tag.picSize);
+        else
+            logLine("song \"%s\": cover not read (%s, error %d%s, %u KB free)", w.title, g_smallWhy, ci.error,
+                    ci.error == 37 ? ": progressive JPEG" : ci.error == 100 ? ": interlaced PNG" : "",
+                    (unsigned)(freeUserMemory() >> 10));
         return m;
     }
     logLine("song \"%s\": cover %d x %d (found in %d ms, made small in %d ms, %d ms of it working)", w.title,
@@ -1260,6 +1374,247 @@ void loadJacket() {
     g_jacketReady = true;
 }
 
+// ── Covers made ahead, as the Music app does ────────────────────────────────
+// When the Music LiveArea opens (when the Music app looks for new songs), the
+// cover thread goes through ux0:music, one file at a time between the songs
+// it is asked for, and makes the cover of every album that has none yet, so
+// a song shows its cover at once even the first time it plays. The files
+// gone through are listed in LIBRARY_PATH (a hash of the path, the size and
+// the time), so the next time only new or changed files are opened. Covers
+// are made until there are kSavedMax; past that, songs make theirs when they
+// play, as before.
+#define LIBRARY_PATH "ux0:data/startscreenmusic/library.bin"
+const char kLibraryMagic[4] = {'S', 'S', 'M', 'L'};
+struct LibEntry {
+    uint32_t path, size, time;
+};
+static_assert(sizeof(LibEntry) == 12, "LibEntry is written as it is");
+const int kLibMax = 4096;  // songs listed (48 KB in memory during a pass)
+
+volatile bool g_libraryWanted;  // the Music LiveArea opened: go through ux0:music
+
+struct Pass {
+    bool active;
+    int depth;  // the folder being read: dirs[depth], or -1 when done
+    SceUID dirs[4];
+    int lens[4];  // g_passPath's length at each depth
+    LibEntry* old;  // the last pass's list, sorted by path
+    int oldCount;
+    SceUID oldUid;
+    SceUID listFd;  // this pass's list, written as it goes
+    LibEntry buf[32];
+    int bufCount, listed;
+    int saved;  // covers in COVER_DIR
+    int files, opened, made, none, unread, over;
+    SceInt64 start;
+};
+Pass g_pass;
+char g_passPath[256];
+
+uint32_t pathHash(const char* s) {
+    uint32_t h = 2166136261u;
+    for (; *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
+    return h;
+}
+
+void sortEntries(LibEntry* e, int n) {  // shell sort by path hash
+    for (int gap = n / 2; gap > 0; gap /= 2)
+        for (int i = gap; i < n; i++) {
+            const LibEntry x = e[i];
+            int j = i;
+            for (; j >= gap && e[j - gap].path > x.path; j -= gap) e[j] = e[j - gap];
+            e[j] = x;
+        }
+}
+
+// True when the last pass listed this file, unchanged.
+bool listedBefore(const LibEntry& le) {
+    int lo = 0, hi = g_pass.oldCount - 1;
+    while (lo <= hi) {
+        const int mid = (lo + hi) / 2;
+        const LibEntry& o = g_pass.old[mid];
+        if (o.path == le.path) return o.size == le.size && o.time == le.time;
+        if (o.path < le.path) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return false;
+}
+
+void list(const LibEntry& le) {
+    Pass& p = g_pass;
+    if (p.listFd < 0 || p.listed >= kLibMax) return;
+    p.buf[p.bufCount++] = le;
+    p.listed++;
+    if (p.bufCount == 32) {
+        if (sceIoWrite(p.listFd, p.buf, sizeof(p.buf)) != (int)sizeof(p.buf)) {
+            sceIoClose(p.listFd);
+            p.listFd = -1;
+        }
+        p.bufCount = 0;
+    }
+}
+
+void startPass() {
+    Pass& p = g_pass;
+    sceClibMemset(&p, 0, sizeof(p));
+    p.oldUid = p.listFd = -1;
+    p.start = sceKernelGetProcessTimeWide();
+    sceIoMkdir("ux0:data/startscreenmusic", 0777);
+    sceIoMkdir(COVER_DIR, 0777);
+    sceClibStrncpy(g_passPath, "ux0:music", sizeof(g_passPath));
+    p.dirs[0] = sceIoDopen(g_passPath);
+    if (p.dirs[0] < 0) return;  // no music
+    p.lens[0] = 9;
+    // The last pass's list.
+    const SceUID fd = sceIoOpen(LIBRARY_PATH, SCE_O_RDONLY, 0);
+    if (fd >= 0) {
+        char magic[4];
+        uint32_t count = 0;
+        if (sceIoRead(fd, magic, 4) == 4 && !sceClibMemcmp(magic, kLibraryMagic, 4) && sceIoRead(fd, &count, 4) == 4 &&
+            count > 0 && count <= (uint32_t)kLibMax) {
+            p.oldUid = allocBlock("StartScreenMusicLibrary", count * sizeof(LibEntry), (uint8_t**)&p.old);
+            if (p.oldUid >= 0 && sceIoRead(fd, p.old, count * sizeof(LibEntry)) == (int)(count * sizeof(LibEntry))) {
+                p.oldCount = (int)count;
+                sortEntries(p.old, p.oldCount);
+            }
+        }
+        sceIoClose(fd);
+    }
+    // This pass's list: its count is written at the end.
+    p.listFd = sceIoOpen(LIBRARY_PATH ".new", SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
+    if (p.listFd >= 0) {
+        const uint32_t zero = 0;
+        if (sceIoWrite(p.listFd, kLibraryMagic, 4) != 4 || sceIoWrite(p.listFd, &zero, 4) != 4) {
+            sceIoClose(p.listFd);
+            p.listFd = -1;
+        }
+    }
+    p.saved = pruneSaved();
+    p.active = true;
+}
+
+void endPass() {
+    Pass& p = g_pass;
+    while (p.depth >= 0 && p.active) sceIoDclose(p.dirs[p.depth--]);
+    if (p.oldUid >= 0) ssm_sceKernelFreeMemBlock(p.oldUid);
+    p.oldUid = -1;
+    bool listed = false;
+    if (p.listFd >= 0) {
+        const uint32_t count = (uint32_t)p.listed;
+        listed = (!p.bufCount || sceIoWrite(p.listFd, p.buf, p.bufCount * sizeof(LibEntry)) ==
+                                     (int)(p.bufCount * sizeof(LibEntry))) &&
+                 sceIoLseek(p.listFd, 4, SCE_SEEK_SET) == 4 && sceIoWrite(p.listFd, &count, 4) == 4;
+        sceIoClose(p.listFd);
+        p.listFd = -1;
+    }
+    if (listed) {
+        sceIoRemove(LIBRARY_PATH);
+        if (sceIoRename(LIBRARY_PATH ".new", LIBRARY_PATH) < 0) sceIoRemove(LIBRARY_PATH ".new");
+    } else {
+        sceIoRemove(LIBRARY_PATH ".new");
+    }
+    p.active = false;
+    // One line, when there were new songs.
+    if (p.opened)
+        logLine("library: %d songs, %d new; %d covers made, %d songs without one, %d not read, %d over %d covers "
+                "(%d s)",
+                p.files, p.opened, p.made, p.none, p.unread, p.over, kSavedMax,
+                (int)((sceKernelGetProcessTimeWide() - p.start) / 1000000));
+}
+
+// A song file at g_passPath: its album's cover made if it has none.
+void passFile(int kind, const SceIoStat& st) {
+    Pass& p = g_pass;
+    p.files++;
+    const uint64_t t = when(st.st_mtime);
+    const LibEntry le = {pathHash(g_passPath), (uint32_t)st.st_size, (uint32_t)(t ^ (t >> 32))};
+    if (listedBefore(le)) {
+        list(le);
+        return;
+    }
+    p.opened++;
+    Tag& tag = g_tag;
+    const bool read = kind == FILE_MP3 ? readTag(g_passPath, tag, NULL) : readMp4Tag(g_passPath, tag);
+    if (!read || !tag.title[0]) {  // no tags: nothing to find it by
+        list(le);
+        return;
+    }
+    if (!tag.picSize) {
+        p.none++;
+        list(le);
+        return;
+    }
+    char name[96];
+    savedNameOf(tag.title, tag.album, tag.artist, name, sizeof(name));
+    if (savedFresh(name)) {  // another song of the album made it
+        list(le);
+        return;
+    }
+    if (p.saved >= kSavedMax) {
+        p.over++;
+        list(le);
+        return;
+    }
+    SceUID pngUid;
+    uint8_t* png;
+    CoverInfo ci;
+    int decodeMs, decodeCpuMs;
+    const uint32_t pngLen = smallCover(tag, g_passPath, false, pngUid, png, ci, decodeMs, decodeCpuMs);
+    if (!pngLen) {
+        p.unread++;
+        // Short of memory now: tried again next time. A picture that can't
+        // be read stays unread.
+        if (sceClibStrcmp(g_smallWhy, "memory")) list(le);
+        return;
+    }
+    saveCoverAs(name, g_passPath, png, pngLen);
+    ssm_sceKernelFreeMemBlock(pngUid);
+    p.made++;
+    p.saved++;
+    list(le);
+}
+
+// One step: the next entry of the folder being read (folders three deep, as
+// scanDir). False once the pass is done.
+bool passStep() {
+    Pass& p = g_pass;
+    while (p.depth >= 0) {
+        SceIoDirent e;
+        if (sceIoDread(p.dirs[p.depth], &e) <= 0) {
+            sceIoDclose(p.dirs[p.depth]);
+            p.depth--;
+            if (p.depth >= 0) g_passPath[p.lens[p.depth]] = 0;
+            continue;
+        }
+        int len = 0;
+        while (e.d_name[len]) len++;
+        const int n = p.lens[p.depth];
+        if (!len || e.d_name[0] == '.' || n + 1 + len >= (int)sizeof(g_passPath)) continue;
+        g_passPath[n] = '/';
+        sceClibMemcpy(g_passPath + n + 1, e.d_name, len + 1);
+        if (SCE_S_ISDIR(e.d_stat.st_mode)) {
+            if (p.depth < 3) {
+                const SceUID d = sceIoDopen(g_passPath);
+                if (d >= 0) {
+                    p.depth++;
+                    p.dirs[p.depth] = d;
+                    p.lens[p.depth] = n + 1 + len;
+                    return true;
+                }
+            }
+            g_passPath[n] = 0;
+            continue;
+        }
+        if (const int kind = songFile(e.d_name, len)) {
+            passFile(kind, e.d_stat);
+            g_passPath[n] = 0;
+            return true;
+        }
+        g_passPath[n] = 0;
+    }
+    return false;
+}
+
 int coverThread(SceSize, void*) {
     findOpt();
     loadJacket();
@@ -1268,14 +1623,25 @@ int coverThread(SceSize, void*) {
     sceClibMemset(&last, 0, sizeof(last));
     int done = 0;
     for (;;) {
-        sceKernelWaitSema(g_wakeCover, 1, NULL);
+        // Asleep unless a pass is going: then a look, and on.
+        if (g_pass.active) sceKernelPollSema(g_wakeCover, 1);
+        else sceKernelWaitSema(g_wakeCover, 1, NULL);
         if (g_forgetCovers) {
             g_forgetCovers = false;
             forgetCovers();
         }
-        if (g_mailSeq != g_mailTaken) continue;  // the last answer not taken yet (taking it wakes this)
+        if (g_libraryWanted && !g_pass.active) {
+            g_libraryWanted = false;
+            startPass();
+        }
+        // A song asked for (its answer free to send) comes first; else a step
+        // of the pass.
         const int seq = g_reqSeq;
-        if ((seq & 1) || seq == done) continue;
+        const bool asked = g_mailSeq == g_mailTaken && !(seq & 1) && seq != done;
+        if (!asked) {
+            if (g_pass.active && !passStep()) endPass();
+            continue;
+        }
         __sync_synchronize();
         sceClibMemcpy(&w, &g_req, sizeof(w));
         __sync_synchronize();
@@ -1306,14 +1672,41 @@ int coverThread(SceSize, void*) {
 // (the date's and hours' left edge) to 430 (the minutes' fixed right edge,
 // power_manage_plugin's layout), top at y 80: as far below the top of the
 // start screen's frame (y 64) as the clock's digits end above its bottom
-// (495 and 511), 16 pixels (measured on screenshots).
-const float kPanelLeft = 60, kPanelRight = 430, kPanelTop = 80;
-const float kPanelScale = (kPanelRight - kPanelLeft) / 504.0f;
+// (495 and 511), 16 pixels (measured on screenshots). 208 pixels high.
+const float kPanelWidth = 370, kPanelHeight = 208;
+const float kPanelScale = kPanelWidth / 504.0f;
 float panelScale() { return kPanelScale; }
+float g_panelLeft = 60, g_panelTop = 80;  // where the panel is, for the clock (see placePanel)
 // A panel point in its group's units: the groups sit at the page's centre
 // (screen 480, 272) and are scaled about it; y up.
-float localX(float nx) { return (kPanelLeft - 480) / kPanelScale + nx; }
-float localY(float ny) { return (272 - kPanelTop) / kPanelScale - ny; }
+float localX(float nx) { return (g_panelLeft - 480) / kPanelScale + nx; }
+float localY(float ny) { return (272 - g_panelTop) / kPanelScale - ny; }
+
+// A theme can move the clock (theme.xml's m_dateLayout): bottom left (the
+// start screen's own, 0 and 3), top left (1) or bottom right (2). The panel
+// stays on the left, lined up with the clock:
+//   clock bottom left: the panel top left, above it, as above;
+//   clock top left: the panel bottom left, below it, 16 pixels above the
+//     frame's bottom, as the clock's digits sit;
+//   clock bottom right: the panel bottom left, level with it;
+//   clock top right (no layout puts it there): the panel top left, level.
+// Read from where the clock's group is laid out (centred, y up): x above 0
+// is the right, y above 0 the top. Measured: bottom left -430, -222; top
+// left -430, 59; bottom right 54, -222.
+const uint32_t kClockCorner = 0xDE1F6BE8;
+struct PosAccess : paf::ui::Widget {
+    const float* pos() const { return (const float*)&m_pos; }
+};
+
+void placePanel(paf::ui::Widget* page) {
+    g_panelLeft = 60;
+    g_panelTop = 80;
+    paf::ui::Widget* clock = findChild(page, kClockCorner);
+    if (!clock) return;
+    const float* p = static_cast<const PosAccess*>(clock)->pos();
+    const bool right = p[0] > 0, top = p[1] > 0;
+    if (right != top) g_panelTop = 511 - 16 - kPanelHeight;  // the panel bottom left
+}
 
 // Parts of the quick menu's Music row, by id.
 const uint32_t kNoteIcon = 0xE219E0DE, kHeading = 0x90E6251E, kTitle = 0x66FDAFE3,
@@ -1334,7 +1727,7 @@ const wchar_t* sonyString(uint32_t id) {
 }
 
 // This start screen's parts (valid while g_screenAlive).
-paf::ui::Widget *g_groups[2], *g_titleLine, *g_artistLine, *g_playIcon, *g_pauseIcon, *g_cover;
+paf::ui::Widget *g_groups[4], *g_titleLine, *g_artistLine, *g_playIcon, *g_pauseIcon, *g_cover;
 paf::ui::SlideBar* g_bar;
 uint32_t g_barVtable;  // checked before each write, as a second guard
 int g_shownSeq = -1;   // the music state the panel shows
@@ -1355,11 +1748,18 @@ UiCover g_uiCover = {-1, NULL, 0, 0, false, false};
 paf::graph::Surface* g_noteTex;  // the row's note, held for good
 paf::graph::SurfacePool* g_pool;  // power_manage_plugin's
 
+extern paf::ui::Widget* g_glass[3];
+extern paf::ui::Widget* g_timeLine;
+extern paf::ui::Widget* g_dateText;
+void showGlass(bool on);
 void screenGone(int gen) {
     if (gen == g_screenGen) {
         g_screenAlive = false;
         g_bar = NULL;
         g_cover = NULL;
+        g_glass[0] = g_glass[1] = g_glass[2] = NULL;
+        g_timeLine = NULL;
+        g_dateText = NULL;
         g_panelShown = false;
     }
 }
@@ -1473,17 +1873,18 @@ void showPicture(paf::graph::Surface* s) {
 float g_coverRgb[3] = {1, 1, 1};  // white for a cover; the theme's for the jacket and note
 
 // What the cover square should show: the song's cover, else Sony's
-// no-cover jacket, else the quick menu's note (kShowNote).
+// no-cover jacket, else nothing (kShowNote).
 int coverWant() {
     if (g_uiCover.data && !g_uiCover.failed) return g_uiCover.id;
     if (g_jacketReady && !g_jacketFailed) return kShowJacket;
     return kShowNote;
 }
 
-// The quick menu's note on the square, at its own 80 x 80, in the theme's colour.
+// The square empty: the quick menu's note texture on it, so a picture's room
+// in the pool is let go, but drawn at no size. The note itself never shows.
 void showNote() {
     if (g_noteTex) giveTexture(g_cover, g_noteTex);
-    setScale(g_cover, 1);
+    setScale(g_cover, 0);
     sceClibMemcpy(g_coverRgb, g_tint, sizeof(g_coverRgb));
     g_coverShows = kShowNote;
 }
@@ -1492,8 +1893,8 @@ void showNote() {
 // next. The jacket is loaded each time it is wanted and goes with the start
 // screen, as covers do: the texture pool has little room. A picture on the
 // square keeps its room in the pool (64 KB: about one cover) until it is let
-// go, and PAF lets it go a moment later: so the note goes up first and the
-// next picture comes on a later tick (on 3.65, loading it at once failed
+// go, and PAF lets it go a moment later: so the square is emptied first and
+// the next picture comes on a later tick (on 3.65, loading it at once failed
 // whenever a picture was up). A picture that still won't load is tried again
 // for a few ticks before the square falls to the next choice.
 void swapCover() {
@@ -1546,10 +1947,26 @@ void applyCover() {
 }
 
 // The volume bar: 380 units from panel x 59, at panel y 200.
-const float kBarLeft = kPanelLeft + 59 * kPanelScale, kBarWidth = 380 * kPanelScale,
-            kBarY = kPanelTop + 200 * kPanelScale;
+const float kBarWidth = 380 * kPanelScale;
+float barLeft() { return g_panelLeft + 59 * kPanelScale; }
+float barY() { return g_panelTop + 200 * kPanelScale; }
 int g_volShown = -1;
 bool g_dragging, g_touching;
+// A tap on a button the plugin saw itself: for when something of the start
+// screen's lies over the panel (a notification that came in standby takes
+// the buttons' touches; the bar's are read here already). Fired a moment
+// after the finger lifts, unless the button fired first.
+int g_tapButton = -1;      // the button the finger landed on
+int g_tapX, g_tapY;        // where
+int g_tapWait;             // ticks until the tap fires itself
+// One press a tap, whichever comes first: the button's own, or the tap
+// firing itself (when the UI is busy, after a skip, the button's own can
+// come after it: two presses would pause and play again, or skip twice).
+int g_tapSeq, g_tapPressedSeq = -1;  // taps landed; the last one a press was made for
+SceUInt64 g_tapPressedAt;
+const float kButtonX[3] = {112, 249, 386}, kButtonY = 262;  // panel units
+void press(uint32_t cmd);
+void pressForTap(uint32_t cmd);
 
 struct PeekBar : paf::ui::SlideBar {
     static void set(paf::ui::SlideBar* w, float v) {
@@ -1560,6 +1977,16 @@ struct PeekBar : paf::ui::SlideBar {
     }
 };
 
+// While a finger drags the bar its knob follows the finger smoothly; let go,
+// it settles onto its step, as the quick menu's does.
+float g_knob;   // where the knob is drawn (0 to 1) while dragged or settling
+int g_settle;   // ticks of settling left
+void drawKnob(float f) {
+    if (*(const uint32_t*)g_bar != g_barVtable) return;
+    g_knob = f;
+    PeekBar::set(g_bar, f);
+}
+
 void showVolume(int vol) {
     if (!g_screenAlive || !g_bar || *(const uint32_t*)g_bar != g_barVtable || vol == g_volShown) return;
     g_volShown = vol;
@@ -1567,15 +1994,28 @@ void showVolume(int vol) {
 }
 
 // Every UI tick while the panel is up: a finger that lands on the bar's
-// row drags it.
+// row drags it; a tap on a button is noted.
 void driveBar() {
     if (!g_screenAlive || !g_panelShown || !g_bar) {
         g_dragging = false;
+        g_tapButton = -1;
+        g_tapWait = 0;
         return;
+    }
+    if (g_settle && !g_dragging) {  // half the way to the step a tick, then on it
+        const float step = g_volShown / 30.0f;
+        drawKnob(--g_settle ? step + (g_knob - step) * 0.5f : step);
+    }
+    if (g_tapWait && !--g_tapWait && g_tapPressedSeq != g_tapSeq && g_tapButton >= 0) {
+        const uint32_t cmds[3] = {CMD_PREVIOUS, CMD_PLAY, CMD_NEXT};
+        pressForTap(cmds[g_tapButton]);
+        g_tapButton = -1;
     }
     SceTouchData t;
     sceClibMemset(&t, 0, sizeof(t));
     if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &t, 1) < 0 || t.reportNum == 0) {
+        if (g_touching && g_tapButton >= 0 && !g_tapWait) g_tapWait = 9;  // lifted: 0.15 s for the button's own
+        if (g_dragging) g_settle = 6;  // about 0.1 s
         g_dragging = g_touching = false;
         return;
     }
@@ -1584,20 +2024,37 @@ void driveBar() {
     const bool landed = !g_touching;
     g_touching = true;
     const int x = t.report[0].x / 2, y = t.report[0].y / 2;  // the panel is 1920 x 1088
+    if (landed) {
+        g_tapButton = -1;
+        g_tapWait = 0;
+        g_tapSeq++;
+        for (int i = 0; i < 3; i++) {
+            const float bx = g_panelLeft + kButtonX[i] * kPanelScale, by = g_panelTop + kButtonY * kPanelScale;
+            if (x > bx - 40 && x < bx + 40 && y > by - 20 && y < by + 20) g_tapButton = i;
+        }
+        g_tapX = x;
+        g_tapY = y;
+    } else if (g_tapButton >= 0 && (x - g_tapX) * (x - g_tapX) + (y - g_tapY) * (y - g_tapY) > 20 * 20) {
+        g_tapButton = -1;  // a drag (the peel), not a tap
+    }
     if (!g_dragging) {
-        if (!landed || x < kBarLeft - 30 || x > kBarLeft + kBarWidth + 30 || y < kBarY - 30 || y > kBarY + 30)
+        if (!landed || x < barLeft() - 30 || x > barLeft() + kBarWidth + 30 || y < barY() - 30 || y > barY() + 30)
             return;
         g_dragging = true;
     }
-    int vol = (int)((x - kBarLeft) * 30.0f / kBarWidth + 0.5f);
-    vol = vol < 0 ? 0 : vol > 30 ? 30 : vol;
-    if (vol == g_volShown) return;
-    sceAVConfigSetSystemVol(vol);
-    // The volume the system took: with AVLS on, it stops at its limit, as
-    // the quick menu's bar does.
-    int real;
-    if (sceAVConfigGetSystemVol(&real) >= 0) vol = real;
-    showVolume(vol);
+    float f = (x - barLeft()) / kBarWidth;
+    f = f < 0 ? 0 : f > 1 ? 1 : f;
+    const int vol = (int)(f * 30 + 0.5f);
+    if (vol != g_volShown) {
+        sceAVConfigSetSystemVol(vol);
+        // The volume the system took: with AVLS on, it stops at its limit,
+        // and so does the knob, as on the quick menu's bar.
+        int real;
+        g_volShown = sceAVConfigGetSystemVol(&real) >= 0 ? real : vol;
+    }
+    if (g_volShown < vol && f > g_volShown / 30.0f) f = g_volShown / 30.0f;
+    g_settle = 0;
+    drawKnob(f);
 }
 
 // The buttons.
@@ -1606,13 +2063,134 @@ Listener* g_listeners[3];
 
 volatile bool g_pollSoon;  // a press: the music thread looks again at once
 
-void onPress(int32_t, paf::ui::Handler*, paf::ui::Event*, void* data) {
-    uint32_t cmd = (uint32_t)(uintptr_t)data;
+// Play and pause show at once, as the quick menu's do, not when the music
+// service next says so; for a moment, until it does, what it says before is
+// not shown.
+SceUInt64 g_heldUntil;
+bool g_heldPlaying;
+
+void showPlaying(bool playing) {
+    g_playState = playing ? 1 : 0;
+    if (g_playIcon) setSize(g_playIcon, playing ? 0 : 64, playing ? 0 : 64);
+    if (g_pauseIcon) setSize(g_pauseIcon, playing ? 64 : 0, playing ? 64 : 0);
+}
+
+// Play or pause shown at once that the music service never took up: what it
+// says shown again, once the moment is over.
+void releaseHold() {
+    if (!g_heldUntil || sceKernelGetProcessTimeWide() <= g_heldUntil) return;
+    g_heldUntil = 0;
+    if (g_screenAlive && g_panelShown) showPlaying(g_now[g_nowIdx].state == 1);
+}
+
+void press(uint32_t cmd) {
     if (cmd == CMD_PLAY && g_playState == 1) cmd = CMD_STOP;  // one button: pause while playing
+    if (cmd == CMD_PLAY || cmd == CMD_STOP) {
+        g_heldPlaying = cmd == CMD_PLAY;
+        g_heldUntil = sceKernelGetProcessTimeWide() + 1500000;
+        showPlaying(g_heldPlaying);
+    }
     musicCommand(cmd);
     g_fastPolls = 12;  // the new song shows as soon as the service has it
     g_pollSoon = true;
     wake(g_wakeMusic);
+}
+
+void pressForTap(uint32_t cmd) {
+    g_tapPressedSeq = g_tapSeq;
+    g_tapPressedAt = sceKernelGetProcessTimeWide();
+    press(cmd);
+}
+
+void onPress(int32_t, paf::ui::Handler*, paf::ui::Event*, void* data) {
+    // This tap's press made already (the button's own came late): let go. A
+    // press more than 1.5 s on is a tap whose landing the plugin missed.
+    if (g_tapPressedSeq == g_tapSeq && sceKernelGetProcessTimeWide() - g_tapPressedAt < 1500000) return;
+    pressForTap((uint32_t)(uintptr_t)data);
+}
+
+// ── The song's time ─────────────────────────────────────────────────────────
+// As the Music app shows it: played / length, on a line under the title and
+// artist. In the panel's colour (the theme's clock colour), not the Music
+// app's green: the played time bright, the length dimmer, as the artist line
+// is. The line is the artist line of a second Music row of the quick
+// menu's, the rest of that row hidden: Sony's own text.
+paf::ui::Widget* g_timeLine;
+const float kTimeY = 146;  // panel units, like the title (74) and artist (110)
+
+void showTime(const Now& n) {
+    if (!g_timeLine) return;
+    char text[32] = "";
+    int played = 0;
+    if (n.length > 0) {
+        played = sceClibSnprintf(text, sizeof(text), "%02d:%02d", n.played / 60, n.played % 60);
+        sceClibSnprintf(text + played, sizeof(text) - played, " / %02d:%02d", n.length / 60, n.length % 60);
+    }
+    setLine(g_timeLine, 2, text);
+    if (g_pafOpt[OPT_TEXT_STYLE].fn && played) {
+        static const float dim[4] __attribute__((aligned(16))) = {1, 1, 1, 0.6f};
+        static const float bright[4] __attribute__((aligned(16))) = {1, 1, 1, 1};
+        const TextStyleFn style = (TextStyleFn)g_pafOpt[OPT_TEXT_STYLE].fn;
+        style(g_timeLine, 2 /* colour */, 0, sceClibStrnlen(text, sizeof(text)), dim);
+        style(g_timeLine, 2, 0, played, bright);
+    }
+}
+
+// ── The theme's clock colour ────────────────────────────────────────────────
+// The panel takes the colour a theme gives the clock (white without one).
+// Where it is: the date's colour, or its text's (a theme sets the text's;
+// the date's own reads white, and the text's can come after the panel is
+// made, so it is read again when the panel shows). On the Vita a widget
+// colour's alpha is its top byte, whatever the headers' getters say (Vita
+// Shell Companion: the quick menu's lines read D8FFFFFF and CCFFFFFF); the
+// colour below it is taken as blue, green, red, the GPU's byte order.
+paf::ui::Widget* g_dateText;  // valid while g_screenAlive
+paf::ui::Widget *g_buttons[3], *g_icons[4];
+
+// The colour read into g_tint; true if it changed.
+bool readTint() {
+    float t[3] = {1, 1, 1};
+    if (g_dateText) {
+        const uint32_t c = g_dateText->GetColor32();
+        float v[4] __attribute__((aligned(16))) = {1, 1, 1, 0};
+        if (c >> 24 && (c & 0xFFFFFF) != 0xFFFFFF) {
+            t[0] = (c & 0xFF) / 255.0f;
+            t[1] = (c >> 8 & 0xFF) / 255.0f;
+            t[2] = (c >> 16 & 0xFF) / 255.0f;
+        } else if (g_pafOpt[OPT_TEXT_STYLE_GET].fn &&
+                   ((TextStyleGetFn)g_pafOpt[OPT_TEXT_STYLE_GET].fn)(g_dateText, 2 /* colour */, 0, v) >= 0 && v[3] > 0) {
+            t[0] = v[0];
+            t[1] = v[1];
+            t[2] = v[2];
+        }
+    }
+    if (!sceClibMemcmp(t, g_tint, sizeof(t))) return false;
+    sceClibMemcpy(g_tint, t, sizeof(t));
+    logLine("theme: clock colour %d %d %d", (int)(t[0] * 255), (int)(t[1] * 255), (int)(t[2] * 255));
+    return true;
+}
+
+// The colour onto the panel: buttons, symbols, the bar and its knob always;
+// the lines only for a theme's colour (else they keep the quick menu's own
+// alphas, title 85%, artist 80%).
+void applyTint() {
+    for (int i = 0; i < 3; i++)
+        if (g_buttons[i]) setTint(g_buttons[i]);
+    for (int i = 0; i < 4; i++)
+        if (g_icons[i]) setTint(g_icons[i]);
+    if (g_bar) {
+        setTint(g_bar);
+        if (g_bar->GetChildrenNum() > 0) setTint(*g_bar->GetChildrenBegin());  // the knob
+    }
+    if (tinted()) {
+        if (g_titleLine) setTint(g_titleLine);
+        if (g_artistLine) setTint(g_artistLine);
+        if (g_timeLine) setTint(g_timeLine);
+    }
+    if (g_cover && g_coverShows == kShowJacket) {  // the no-cover jacket is in the theme's colour too
+        sceClibMemcpy(g_coverRgb, g_tint, sizeof(g_coverRgb));
+        setV4(PAF_SET_COLOR, 0x10001, g_cover, g_coverRgb[0], g_coverRgb[1], g_coverRgb[2], 1);
+    }
 }
 
 // The music state onto the panel (UI thread); a song without a title or
@@ -1622,10 +2200,11 @@ void applyMusic() {
     if (!g_screenAlive || !g_groups[0] || g_shownSeq == g_nowSeq) return;
     g_shownSeq = g_nowSeq;
     const Now& n = g_now[g_nowIdx];
-    g_playState = n.state;
     if (n.shown != g_panelShown) {
-        show(g_groups[0], n.shown);
-        show(g_groups[1], n.shown);
+        if (n.shown && readTint()) applyTint();
+        for (int i = 0; i < 4; i++)
+            if (g_groups[i]) show(g_groups[i], n.shown);
+        showGlass(n.shown);
         g_panelShown = n.shown;
     }
     if (!n.shown) return;
@@ -1637,9 +2216,169 @@ void applyMusic() {
         if (n.artist[0]) setLine(g_artistLine, 1, n.artist);
         else setLineW(g_artistLine, 1, sonyString(kUnknown));
     }
-    const bool playing = n.state == 1;
-    if (g_playIcon) setSize(g_playIcon, playing ? 0 : 64, playing ? 0 : 64);
-    if (g_pauseIcon) setSize(g_pauseIcon, playing ? 64 : 0, playing ? 64 : 0);
+    showTime(n);
+    bool playing = n.state == 1;
+    if (g_heldUntil) {
+        if (playing == g_heldPlaying || sceKernelGetProcessTimeWide() > g_heldUntil) g_heldUntil = 0;
+        else playing = g_heldPlaying;
+    }
+    showPlaying(playing);
+}
+
+// ── The glass ───────────────────────────────────────────────────────────────
+// Behind the panel, so it reads on any wallpaper: Sony's own 3x3 textures
+// from power_manage_plugin, stretched as Sony stretches them. The edge: the
+// frame Sony draws round the start screen's notifications, its light edge at
+// 24% white. The dark: Sony's filled box made for that frame, 2 pixels
+// inside it, its corners following the frame's, in black at 30%. PAF draws
+// only that box's top corners right (it is 44 texels in a texture 48 wide;
+// its bottom ones come out square), so the dark is two halves of it, the
+// lower one turned round: four top corners. (A picture of the whole dark,
+// made here, doesn't fit in SceShell's texture pools.) Their planes are
+// quick menu dividers (impose_plugin), from rows opened before the panel:
+// over the start screen's picture, under the panel's buttons, which keep
+// their touches.
+const uint32_t kPlateTemplate = 0x1FF37238;  // a quick menu row (hidden) and its divider
+const uint32_t kFillTex = 0x3982F37E, kFrameTex = 0xE1E2F764;
+// Round the panel with 9 pixels to spare at the sides, 10 at the top and
+// bottom.
+const float kGlassSide = 9, kGlassEnd = 10;
+const float kFillInset = 2;
+const float kGlassDark = 0.30f;  // the dark's alpha
+paf::graph::Surface *g_fillTex, *g_frameTex;  // held for good
+paf::ui::Widget* g_glass[3];                  // the dark's halves and the frame (valid while g_screenAlive)
+
+struct PlaneAccess : paf::ui::Plane {
+    paf::graph::PlaneObj* obj() const { return m_planeobj; }
+};
+
+// One of plugin's textures, its reference kept for good.
+paf::graph::Surface* pluginTexture(paf::Plugin* plugin, uint32_t hash) {
+    if (!plugin || !g_pafOpt[OPT_GET_TEXTURE].fn) return NULL;
+    HashID id;
+    sceClibMemset(&id, 0, sizeof(id));
+    id.hash = hash;
+    TexRef ref(NULL);
+    ((GetTextureFn)g_pafOpt[OPT_GET_TEXTURE].fn)(&ref.ptr, plugin, *(const paf::IDParam*)&id);
+    return ref.ptr.get();
+}
+
+// The plate template opened into parent: its divider plane (the row hidden).
+paf::ui::Widget* openPlate(paf::Plugin* impose, paf::ui::Widget* parent) {
+    int before = 0;
+    for (paf::list<paf::ui::Widget*>::iterator it = parent->GetChildrenBegin(); it != parent->GetChildrenEnd(); ++it)
+        before++;
+    HashID id;
+    sceClibMemset(&id, 0, sizeof(id));
+    id.hash = kPlateTemplate;
+    const void* param[2] = {NULL, NULL};
+    const int rc = ((TemplateOpenFn)g_paf[PAF_OPEN].fn)(impose, parent, *(const paf::IDParam*)&id, param);
+    if (rc < 0) {
+        logLine("glass: template open 0x%08X", (unsigned)rc);
+        return NULL;
+    }
+    paf::ui::Widget* added[2] = {NULL, NULL};
+    int count = 0;
+    for (paf::list<paf::ui::Widget*>::iterator it = parent->GetChildrenBegin(); it != parent->GetChildrenEnd(); ++it) {
+        if (count >= before && count < before + 2) added[count - before] = *it;
+        count++;
+    }
+    if (count != before + 2 || !added[0] || !added[1]) {
+        logLine("glass: %d parts added", count - before);
+        return NULL;
+    }
+    setScale(added[0], 0);  // the row
+    setSize(added[1], 0, 0);  // nothing until dressed
+    return added[1];
+}
+
+// A divider made a pane of the glass: tex stretched over a rectangle of the
+// screen (its size the plane's, not the texture's), turned round if asked,
+// in colour.
+void dressGlass(int i, paf::graph::Surface* tex, float left, float top, float right, float bottom, bool turned,
+                float r, float g, float b, float a) {
+    paf::ui::Widget* w = g_glass[i];
+    if (!w) return;
+    if (!tex) {
+        setSize(w, 0, 0);
+        return;
+    }
+    const uint32_t obj = (uint32_t)((const PlaneAccess*)w)->obj();
+    const bool objOk = obj >= 0x80000000u && obj < 0xA0000000u && !(obj & 3);
+    if (objOk && g_pafOpt[OPT_SCALE_MODE].fn)
+        ((ScaleModeFn)g_pafOpt[OPT_SCALE_MODE].fn)((paf::graph::PlaneObj*)obj, 0, 0);  // SCALE_SIZE both ways
+    giveTexture(w, tex);
+    setSize(w, right - left, bottom - top);
+    // The clock's group is the screen, centred, y up.
+    setPos(w, (left + right) / 2 - 480, 272 - (top + bottom) / 2);
+    if (turned && g_pafOpt[OPT_SET_ROT].fn) {
+        const float rot[4] __attribute__((aligned(16))) = {0, 0, 3.14159265f, 0};  // half a turn, in place
+        ((SetRotFn)g_pafOpt[OPT_SET_ROT].fn)(w, rot, 0, NULL, 0x10006 /* ANIM_ROT */, 0, 0.0f, NULL, NULL);
+    }
+    setV4(PAF_SET_COLOR, 0x10001, w, r, g, b, a);
+}
+
+void showGlass(bool on) {
+    for (int i = 0; i < 3; i++)
+        if (g_glass[i]) setScale(g_glass[i], on ? 1.0f : 0.0f);
+}
+
+// The quick menu's Music row opened at the end of parent: its heading and
+// bar group and its lines and buttons group (its divider hidden), placed and
+// sized as the panel. false if it didn't open.
+bool openRow(paf::Plugin* impose, paf::ui::Widget* parent, paf::ui::Widget** heading, paf::ui::Widget** controls) {
+    HashID id;
+    sceClibMemset(&id, 0, sizeof(id));
+    id.hash = kRowTemplate;
+    const void* param[2] = {NULL, NULL};  // TemplateOpenParam: no event table, no sibling
+    const int rc = ((TemplateOpenFn)g_paf[PAF_OPEN].fn)(impose, parent, *(const paf::IDParam*)&id, param);
+    if (rc < 0) {
+        logLine("panel: template open 0x%08X", (unsigned)rc);
+        return false;
+    }
+    // The template added three children at the end: the heading and bar
+    // group, the lines and buttons group, the quick menu's divider.
+    paf::ui::Widget* added[3] = {NULL, NULL, NULL};
+    int count = 0;
+    for (paf::list<paf::ui::Widget*>::iterator it = parent->GetChildrenBegin(); it != parent->GetChildrenEnd(); ++it)
+        added[count++ % 3] = *it;
+    if (count < 4) return false;
+    *heading = added[count % 3];
+    *controls = added[(count + 1) % 3];
+    setSize(added[(count + 2) % 3], 0, 0);  // the divider
+    for (int i = 0; i < 2; i++) {
+        paf::ui::Widget* g = i ? *controls : *heading;
+        setPos(g, 0, 0);
+        setScale(g, kPanelScale);
+    }
+    return true;
+}
+
+// Every child of group but keep, hidden.
+void keepOnly(paf::ui::Widget* group, paf::ui::Widget* keep) {
+    for (paf::list<paf::ui::Widget*>::iterator it = group->GetChildrenBegin(); it != group->GetChildrenEnd(); ++it)
+        if (*it != keep) setScale(*it, 0);
+}
+
+// The song's time: from a second Music row, opened before the panel's (see
+// addPanel).
+void addTimeLine(paf::Plugin* impose, paf::ui::Widget* parent) {
+    g_groups[2] = g_groups[3] = g_timeLine = NULL;
+    paf::ui::Widget *heading, *controls;
+    if (!openRow(impose, parent, &heading, &controls)) return;
+    g_groups[2] = heading;
+    g_groups[3] = controls;
+    show(heading, false);
+    show(controls, false);
+    g_timeLine = findChild(controls, kArtist);
+    keepOnly(heading, NULL);
+    keepOnly(controls, g_timeLine);
+    if (!g_timeLine) {
+        logLine("time line not found");
+        return;
+    }
+    setSize(g_timeLine, 334, 40);
+    setPos(g_timeLine, localX(170) + 364, localY(kTimeY) + 20);
 }
 
 void addPanel(paf::ui::Widget* page) {
@@ -1651,46 +2390,48 @@ void addPanel(paf::ui::Widget* page) {
         logLine("panel: impose_plugin not found");
         return;
     }
+    paf::Plugin* power = ((PluginFindFn)g_paf[PAF_FIND].fn)("power_manage_plugin");
     if (!g_pool) {
         // PAF's Plugin keeps its texture pool at 0xD4 (Vita Shell Companion).
-        paf::Plugin* power = ((PluginFindFn)g_paf[PAF_FIND].fn)("power_manage_plugin");
         if (power) g_pool = *(paf::graph::SurfacePool* const*)((const char*)power + 0xD4);
     }
+    if (power && !g_fillTex) g_fillTex = pluginTexture(power, kFillTex);
+    if (power && !g_frameTex) g_frameTex = pluginTexture(power, kFrameTex);
+    placePanel(page);
     // Into the clock's group (full screen, centred like the page), so it
-    // fades with the date and time on a peel.
+    // fades with the date and time on a peel. The glass and the song's time
+    // first, so the panel draws over them and its buttons take the touches
+    // (the time's row over the buttons kept them from them). Its parts are
+    // found in its own groups, not the time row's.
     paf::ui::Widget* parent = findChild(page, kClockGroup);
     if (!parent) parent = page;
-    HashID id;
-    sceClibMemset(&id, 0, sizeof(id));
-    id.hash = kRowTemplate;
-    const void* param[2] = {NULL, NULL};  // TemplateOpenParam: no event table, no sibling
-    const int rc = ((TemplateOpenFn)g_paf[PAF_OPEN].fn)(impose, parent, *(const paf::IDParam*)&id, param);
-    if (rc < 0) {
-        logLine("panel: template open 0x%08X", (unsigned)rc);
-        return;
-    }
-    // The template added three children at the end: the heading and bar
-    // group, the lines and buttons group, the quick menu's divider.
-    paf::ui::Widget* added[3] = {NULL, NULL, NULL};
-    int count = 0;
-    for (paf::list<paf::ui::Widget*>::iterator it = parent->GetChildrenBegin(); it != parent->GetChildrenEnd(); ++it)
-        added[count++ % 3] = *it;
-    if (count < 4) return;
-    paf::ui::Widget* heading = added[count % 3];
-    paf::ui::Widget* controls = added[(count + 1) % 3];
-    setSize(added[(count + 2) % 3], 0, 0);  // the divider
+    for (int i = 0; i < 3; i++) g_glass[i] = i == 0 || g_glass[i - 1] ? openPlate(impose, parent) : NULL;
+    addTimeLine(impose, parent);
+    paf::ui::Widget *heading, *controls;
+    if (!openRow(impose, parent, &heading, &controls)) return;
+    auto part = [heading, controls](uint32_t id) {
+        paf::ui::Widget* w = findChild(heading, id);
+        return w ? w : findChild(controls, id);
+    };
+    const float left = g_panelLeft - kGlassSide, top = g_panelTop - kGlassEnd,
+                right = g_panelLeft + kPanelWidth + kGlassSide, bottom = g_panelTop + kPanelHeight + kGlassEnd,
+                middle = (top + bottom) / 2;
+    dressGlass(0, g_fillTex, left + kFillInset, top + kFillInset, right - kFillInset, middle, false, 0, 0, 0,
+               kGlassDark);
+    dressGlass(1, g_fillTex, left + kFillInset, middle, right - kFillInset, bottom - kFillInset, true, 0, 0, 0,
+               kGlassDark);
+    dressGlass(2, g_frameTex, left, top, right, bottom, false, 1, 1, 1, 0.24f);
+    if (!g_fillTex || !g_frameTex) logLine("glass: textures %s %s", g_fillTex ? "fill" : "-", g_frameTex ? "frame" : "-");
 
     // Layout, in quick-menu units from the panel's top left: the cover 150
     // square at the top left (the row's note plane, centred at 75, 75);
-    // title and artist from x 170, centred on the cover (y 55 / 95); bar
-    // centre (249, 200); buttons at (112 / 249 / 386, 262). Left-anchored
+    // title, artist and the song's time from x 170, the time's digits level
+    // with the cover's bottom (y 74 / 110 / 146, the time from addTimeLine);
+    // bar centre (249, 200);
+    // buttons at (112 / 249 / 386, 262). Left-anchored
     // parts count from the group's left edge (-364); text takes its left edge
     // from the position; the title's and artist's vertical alignment shifts
     // them 20. No "Music" heading: the cover says what it is.
-    setPos(heading, 0, 0);
-    setPos(controls, 0, 0);
-    setScale(heading, kPanelScale);
-    setScale(controls, kPanelScale);
     struct Place {
         uint32_t id;
         float nx, ny;
@@ -1699,56 +2440,42 @@ void addPanel(paf::ui::Widget* page) {
     };
     const Place places[] = {
         {kNoteIcon, 75, 75, true, 0},
-        {kTitle, 170, 55, true, -20},   {kArtist, 170, 95, true, 20},
-        {kNoMusic, 170, 55, true, -20}, {kBar, 249, 200, false, 0},
+        {kTitle, 170, 74, true, -20},   {kArtist, 170, 110, true, 20},
+        {kNoMusic, 170, 74, true, -20}, {kBar, 249, 200, false, 0},
         {kPrev, 112, 262, false, 0},    {kPrevIcon, 112, 262, false, 0},
         {kPlay, 249, 262, false, 0},    {kPlayIcon, 249, 262, false, 0},
         {kPauseIcon, 249, 262, false, 0},
         {kNext, 386, 262, false, 0},    {kNextIcon, 386, 262, false, 0},
     };
     for (unsigned i = 0; i < sizeof(places) / sizeof(places[0]); i++) {
-        paf::ui::Widget* w = findChild(page, places[i].id);
+        paf::ui::Widget* w = part(places[i].id);
         if (w) setPos(w, localX(places[i].nx) + (places[i].left ? 364 : 0), localY(places[i].ny) + places[i].shift);
     }
     paf::ui::Widget* w;
-    if ((w = findChild(page, kAppIcon))) setSize(w, 0, 0);  // a blank square in the quick menu's row
-    if ((w = findChild(page, kNoMusic))) setSize(w, 0, 0);  // the panel only shows with a song
-    if ((w = findChild(page, kHeading))) setScale(w, 0);    // no "Music" heading
-    // The theme's clock colour (white unless a theme sets its own). On the
-    // Vita a colour's alpha is its top byte, whatever the headers' getters
-    // say (Vita Shell Companion: the quick menu's lines read D8FFFFFF and
-    // CCFFFFFF); the colour below it is taken as blue, green, red, the GPU's
-    // byte order.
-    g_tint[0] = g_tint[1] = g_tint[2] = 1;
-    if ((w = findChild(page, kDateText))) {
-        const uint32_t c = w->GetColor32();
-        if (c >> 24) {
-            g_tint[0] = (c & 0xFF) / 255.0f;
-            g_tint[1] = (c >> 8 & 0xFF) / 255.0f;
-            g_tint[2] = (c >> 16 & 0xFF) / 255.0f;
-        }
-        if (tinted()) logLine("theme: clock colour %08X", (unsigned)c);
-    }
-    // The cover square: the note plane (applyCover gives it its colour).
-    g_cover = findChild(page, kNoteIcon);
+    if ((w = part(kAppIcon))) setSize(w, 0, 0);  // a blank square in the quick menu's row
+    if ((w = part(kNoMusic))) setSize(w, 0, 0);  // the panel only shows with a song
+    if ((w = part(kHeading))) setScale(w, 0);    // no "Music" heading
+    // The theme's clock colour (see readTint).
+    g_dateText = findChild(page, kDateText);
+    readTint();
+    // The cover square: the note plane (applyCover gives it its colour),
+    // empty until its picture comes.
+    g_cover = part(kNoteIcon);
     g_coverShows = 0;
     if (g_cover) {
         setTint(g_cover);
         if (!g_noteTex) g_noteTex = holdTexture(g_cover);
+        setScale(g_cover, 0);
     }
 
-    g_titleLine = findChild(page, kTitle);
-    g_artistLine = findChild(page, kArtist);
+    g_titleLine = part(kTitle);
+    g_artistLine = part(kArtist);
     // To the panel's right edge; in the quick menu's own colours (title 85%,
     // artist 80% white, impose_plugin's styles).
     if (g_titleLine) setSize(g_titleLine, 334, 40);
     if (g_artistLine) setSize(g_artistLine, 334, 40);
-    if (tinted()) {  // the lines keep their own alphas (85% and 80%)
-        if (g_titleLine) setTint(g_titleLine);
-        if (g_artistLine) setTint(g_artistLine);
-    }
-    g_playIcon = findChild(page, kPlayIcon);
-    g_pauseIcon = findChild(page, kPauseIcon);
+    g_playIcon = part(kPlayIcon);
+    g_pauseIcon = part(kPauseIcon);
 
     // The active look, always: buttons switched on, in their normal state
     // (Enable alone leaves them dimmed, as Vita Shell Companion found) and
@@ -1756,28 +2483,24 @@ void addPanel(paf::ui::Widget* page) {
     const uint32_t buttons[3] = {kPrev, kPlay, kNext};
     const uint32_t cmds[3] = {CMD_PREVIOUS, CMD_PLAY, CMD_NEXT};
     for (int i = 0; i < 3; i++) {
-        paf::ui::Widget* b = findChild(page, buttons[i]);
+        paf::ui::Widget* b = g_buttons[i] = part(buttons[i]);
         if (!b) continue;
         if (!g_listeners[i]) g_listeners[i] = new (g_listenerMem[i]) Listener(onPress, (void*)(uintptr_t)cmds[i]);
         ((EnableFn)g_paf[PAF_BTN_ENABLE].fn)((paf::ui::ButtonBase*)b, true);
         ((paf::ui::ButtonBase*)b)->ChangeButtonState(paf::ui::ButtonBase::ST_BTN_NORMAL);
-        setTint(b);
         ((AddListenerFn)g_paf[PAF_ADD_LISTENER].fn)(b, 0x10000008 /* CB_BTN_DECIDE */, g_listeners[i], true);
     }
     const uint32_t icons[4] = {kPrevIcon, kPlayIcon, kPauseIcon, kNextIcon};
-    for (int i = 0; i < 4; i++)
-        if ((w = findChild(page, icons[i]))) setTint(w);
-    g_bar = (paf::ui::SlideBar*)findChild(page, kBar);
-    if (g_bar) {
-        setTint(g_bar);
-        if (g_bar->GetChildrenNum() > 0) setTint(*g_bar->GetChildrenBegin());  // the knob
-    }
+    for (int i = 0; i < 4; i++) g_icons[i] = part(icons[i]);
+    g_bar = (paf::ui::SlideBar*)part(kBar);
+    applyTint();
     g_barVtable = g_bar ? *(const uint32_t*)g_bar : 0;
     g_volShown = -1;
 
     // Hidden until the music thread says a song is loaded.
     show(heading, false);
     show(controls, false);
+    showGlass(false);
     g_groups[0] = heading;
     g_groups[1] = controls;
     g_panelShown = false;
@@ -1905,6 +2628,7 @@ void tick(void*) {
     g_lastTick = t;
     driveBar();
     applyMusic();
+    releaseHold();
     takeCover();
     applyCover();
     if (!g_screenAlive || t < g_nextSlow) return;
@@ -1944,6 +2668,10 @@ void noteLiveArea(int i, uint32_t a0) {
     g_musicLiveArea = open;
     g_pollSoon = true;  // the panel follows at once
     wake(g_wakeMusic);
+    if (open) {  // the Music app looks for new songs now: their covers are made too
+        g_libraryWanted = true;
+        wake(g_wakeCover);
+    }
 }
 
 // Six words passed on: enough for each of these (extra ones are read from the
