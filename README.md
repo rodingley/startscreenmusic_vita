@@ -4,7 +4,7 @@ Music controls on the PS Vita's start screen (lock screen), built from the Vita'
 
 ![Start Screen Music on the PS Vita's start screen](images/start_screen.png)
 
-While a song is playing, or paused with the Music app or its LiveArea open, the start screen shows the song's cover, title, artist and time, a volume bar, and previous / play / next: whenever the Quick Menu shows its Music row, wherever the music was started. It is the Quick Menu's own Music row, laid out on the start screen with the clock. Like the clock, it is simply there when the screen lights up, and a new song's title and cover replace the old ones the way the Quick Menu's do. When the Music LiveArea closes, it goes.
+While a song is playing, or paused with the Music app or its LiveArea open, the start screen shows the song's cover, title, artist and time, a volume bar, and previous / play / next: whenever the Quick Menu shows its Music row, wherever the music was started. It is the Quick Menu's own Music row, laid out on the start screen with the clock. Like the clock, it is simply there when the screen lights up, and a new song's title and cover replace the old ones the way the Quick Menu's do. When the Music LiveArea closes, it goes. After the Vita has slept with the music paused, it comes back once you unlock the Vita.
 
 Everything on it is Sony's, read from the Vita while it runs; nothing of Sony's ships with the plugin:
 

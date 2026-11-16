@@ -392,7 +392,7 @@ void musicCommand(uint32_t cmd) {
 // then published by flipping g_nowIdx. Note: a reader slower than two
 // polls (1 s) could see a half-written copy; the UI reads in microseconds.
 struct Now {
-    int state;  // the service's play status: 1 playing, 2 paused (0 none, 10 nothing to play)
+    int state;  // the service's play status: 1 playing, 2 paused (0 none, 10 the Music app asleep)
     bool loaded;  // a song in the shell's music player
     bool shown;   // the panel shows, as the quick menu's Music row would
     char title[256], artist[256];  // empty: Sony's "Unknown"
@@ -432,26 +432,42 @@ Want g_req;
 volatile int g_reqSeq;
 Want g_reqLast;  // the music thread's: the song asked for last
 
+// While the music thread waits on the music service: since when. As the Vita
+// wakes from sleep the service takes seconds to answer.
+volatile SceInt64 g_callSince;
 void pollMusic() {
     uint32_t st[0x70 / 4];
     sceClibMemset(st, 0, sizeof(st));
     const InData in = {&kPlayer, sizeof(kPlayer)};
+    const SceInt64 polled = sceKernelGetProcessTimeWide();
+    g_callSince = polled;
     const int rcS = svcCall(0x30007, &in, 1, st, sizeof(st));
+    g_callSince = 0;
 
     const Now& was = g_now[g_nowIdx];
     Now& n = g_now[g_nowIdx ^ 1];
-    n.state = rcS >= 0 ? (int)st[0x10 / 4] : 0;
+    // 1 playing, 2 paused. 10 once the Vita has slept with the music paused
+    // (seen on 3.65): the Music app, which plays it, sleeps until the Vita is
+    // unlocked, so nothing can play it from the start screen: no panel.
+    const int raw = rcS >= 0 ? (int)st[0x10 / 4] : 0;
+    n.state = raw;
     // The song (6 KB from the service) only when the player has one.
     int rcT = -1;
     sceClibMemset(&g_track, 0, sizeof(g_track));
-    if (n.state == 1 || n.state == 2) rcT = svcCall(0x3001B, &in, 1, &g_track, sizeof(g_track));
-    n.loaded = rcT >= 0 && (n.state == 1 || n.state == 2);
+    const bool hasSong = n.state == 1 || n.state == 2;
+    if (hasSong) rcT = svcCall(0x3001B, &in, 1, &g_track, sizeof(g_track));
+    n.loaded = rcT >= 0 && hasSong;
     // The panel shows when the quick menu's Music row does (seen on 3.65):
     // while music plays, and while the player has a song and the Music app's
     // LiveArea is open, the app running or not, wherever the music was
     // started. Closing the LiveArea stops the music and the row goes; it
     // comes back when the LiveArea opens again.
-    n.shown = n.loaded && (n.state == 1 || g_musicLiveArea || !g_liveAreaWatched);
+    // Waking, the player can say 1 or 2 for a moment between its 10s: the
+    // panel waits until it has said no 10 for 2 seconds.
+    static SceInt64 asleepAt;
+    if (raw == 10) asleepAt = polled;
+    const bool awake = !asleepAt || polled - asleepAt > 2000000;
+    n.shown = n.loaded && awake && (n.state == 1 || g_musicLiveArea || !g_liveAreaWatched);
     if (was.loaded && !n.loaded) {  // the player has no song now
         g_forgetCovers = true;
         wake(g_wakeCover);
@@ -1257,9 +1273,9 @@ CoverMail findCover(const Want& w) {
         if (!sceClibStrcmp(g_smallWhy, "too big"))
             logLine("song \"%s\": cover too big (%u bytes)", w.title, (unsigned)g_tag.picSize);
         else
-            logLine("song \"%s\": cover not read (%s, error %d%s, %u KB free)", w.title, g_smallWhy, ci.error,
+            logLine("song \"%s\": cover not read (%s, error %d%s, %d KB free)", w.title, g_smallWhy, ci.error,
                     ci.error == 37 ? ": progressive JPEG" : ci.error == 100 ? ": interlaced PNG" : "",
-                    (unsigned)(freeUserMemory() >> 10));
+                    (int)freeUserMemory() >> 10);
         return m;
     }
     logLine("song \"%s\": cover %d x %d (found in %d ms, made small in %d ms, %d ms of it working)", w.title,
@@ -1392,6 +1408,7 @@ static_assert(sizeof(LibEntry) == 12, "LibEntry is written as it is");
 const int kLibMax = 4096;  // songs listed (48 KB in memory during a pass)
 
 volatile bool g_libraryWanted;  // the Music LiveArea opened: go through ux0:music
+int g_passWaits;  // tries left to start a pass that waits for memory (every 5 s)
 
 struct Pass {
     bool active;
@@ -1454,7 +1471,10 @@ void list(const LibEntry& le) {
     }
 }
 
-void startPass() {
+// False when the last pass's list is there but SceShell is short of the
+// memory to hold it (a moment: the LiveArea opening takes some): the pass
+// waits for it, rather than opening every song again.
+bool startPass() {
     Pass& p = g_pass;
     sceClibMemset(&p, 0, sizeof(p));
     p.oldUid = p.listFd = -1;
@@ -1463,7 +1483,7 @@ void startPass() {
     sceIoMkdir(COVER_DIR, 0777);
     sceClibStrncpy(g_passPath, "ux0:music", sizeof(g_passPath));
     p.dirs[0] = sceIoDopen(g_passPath);
-    if (p.dirs[0] < 0) return;  // no music
+    if (p.dirs[0] < 0) return true;  // no music
     p.lens[0] = 9;
     // The last pass's list.
     const SceUID fd = sceIoOpen(LIBRARY_PATH, SCE_O_RDONLY, 0);
@@ -1473,7 +1493,12 @@ void startPass() {
         if (sceIoRead(fd, magic, 4) == 4 && !sceClibMemcmp(magic, kLibraryMagic, 4) && sceIoRead(fd, &count, 4) == 4 &&
             count > 0 && count <= (uint32_t)kLibMax) {
             p.oldUid = allocBlock("StartScreenMusicLibrary", count * sizeof(LibEntry), (uint8_t**)&p.old);
-            if (p.oldUid >= 0 && sceIoRead(fd, p.old, count * sizeof(LibEntry)) == (int)(count * sizeof(LibEntry))) {
+            if (p.oldUid < 0) {
+                sceIoClose(fd);
+                sceIoDclose(p.dirs[0]);
+                return false;
+            }
+            if (sceIoRead(fd, p.old, count * sizeof(LibEntry)) == (int)(count * sizeof(LibEntry))) {
                 p.oldCount = (int)count;
                 sortEntries(p.old, p.oldCount);
             }
@@ -1491,6 +1516,7 @@ void startPass() {
     }
     p.saved = pruneSaved();
     p.active = true;
+    return true;
 }
 
 void endPass() {
@@ -1624,15 +1650,21 @@ int coverThread(SceSize, void*) {
     int done = 0;
     for (;;) {
         // Asleep unless a pass is going: then a look, and on.
+        // A pass waiting for memory: a look every 5 seconds.
         if (g_pass.active) sceKernelPollSema(g_wakeCover, 1);
-        else sceKernelWaitSema(g_wakeCover, 1, NULL);
+        else if (g_passWaits) {
+            SceUInt wait = 5 * 1000 * 1000;
+            sceKernelWaitSema(g_wakeCover, 1, &wait);
+        } else sceKernelWaitSema(g_wakeCover, 1, NULL);
         if (g_forgetCovers) {
             g_forgetCovers = false;
             forgetCovers();
         }
-        if (g_libraryWanted && !g_pass.active) {
+        if ((g_libraryWanted || g_passWaits) && !g_pass.active) {
+            if (g_libraryWanted) g_passWaits = 12;  // a minute
             g_libraryWanted = false;
-            startPass();
+            if (startPass()) g_passWaits = 0;
+            else if (!--g_passWaits) logLine("library: SceShell short of memory, not gone through");
         }
         // A song asked for (its answer free to send) comes first; else a step
         // of the pass.
@@ -2098,8 +2130,11 @@ void press(uint32_t cmd) {
 
 void pressForTap(uint32_t cmd) {
     g_tapPressedSeq = g_tapSeq;
-    g_tapPressedAt = sceKernelGetProcessTimeWide();
     press(cmd);
+    // Timed from when the press is made: just after the Vita wakes, the music
+    // service takes seconds to answer and the UI waits for it, so the
+    // button's own press for this tap can come well after the tap.
+    g_tapPressedAt = sceKernelGetProcessTimeWide();
 }
 
 void onPress(int32_t, paf::ui::Handler*, paf::ui::Event*, void* data) {
@@ -2623,8 +2658,27 @@ volatile bool g_tickRan;  // SceShell's UI loop is running
 volatile SceInt64 g_lastTick;  // when it last ran
 
 void tick(void*) {
-    g_tickRan = true;
     const SceInt64 t = sceKernelGetProcessTimeWide();
+    // Back from the screen being off (or the Vita asleep): the music thread
+    // looks at once, and quickly for a moment, so the panel shows what the
+    // player has now, not what it had before.
+    if (g_tickRan && t - g_lastTick > 500000) {
+        g_fastPolls = 12;
+        g_pollSoon = true;
+        wake(g_wakeMusic);
+        // The music service still answering after a second: the Vita has
+        // slept, and what the panel showed may be gone. It goes now, and
+        // comes back when the service says so.
+        const SceInt64 since = g_callSince;
+        if (since && t - since > 1000000 && g_panelShown) {
+            for (int i = 0; i < 4; i++)
+                if (g_groups[i]) show(g_groups[i], false);
+            showGlass(false);
+            g_panelShown = false;
+            g_shownSeq = g_nowSeq;
+        }
+    }
+    g_tickRan = true;
     g_lastTick = t;
     driveBar();
     applyMusic();

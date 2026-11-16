@@ -524,11 +524,14 @@ int updateThread(SceSize, void*) {
         g_startedHttp = rc >= 0;
         up = rc >= 0 || rc == (int)SCE_HTTP_ERROR_ALREADY_INITED;
     }
-    // SceShell keeps working room: no check when the pools left it short.
+    // SceShell keeps working room: no check when this check's own pools left
+    // it short. SceShell's own pools are set aside already: with them the
+    // check takes none of its memory (a Vita with many plugins can read below
+    // zero, and its plugin would never be updated).
     const int kb = freeKb();
     int certRc = 0;
     note("network not started (0x%08X)", (unsigned)rc);
-    if (up && kb < 256) {
+    if (up && (g_startedSsl || g_startedHttp) && kb < 256) {
         note("not now");
     } else if (up) {
         static SceHttpsData certs[UPDATE_CERT_COUNT];
