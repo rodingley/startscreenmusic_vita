@@ -60,8 +60,6 @@ From the song's file in `ux0:music`: an MP3's ID3 picture, or an M4A / MP4's cov
 
 Like the Vita's own media apps, the plugin keeps the small covers on the memory card, one for each album, so a song shows its cover at once, even after a restart. As the Music app does, it looks for new songs when the Music LiveArea opens and makes their covers in the background, so even a song's first play shows its cover straight away. A song whose file has changed has its cover made again, and once there are 300 covers (about 13 MB) the oldest go.
 
-With the LowMemMode plugin on, covers can take longer to show.
-
 ### Files on the Vita
 
 In `ur0:tai/`:
