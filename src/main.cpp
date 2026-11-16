@@ -2244,7 +2244,7 @@ const uint32_t kFillTex = 0x3982F37E, kFrameTex = 0xE1E2F764;
 // bottom.
 const float kGlassSide = 9, kGlassEnd = 10;
 const float kFillInset = 2;
-const float kGlassDark = 0.30f;  // the dark's alpha
+const float kGlassDark = 0.50f;  // the dark's alpha: half, so the lines read on bright wallpapers too
 paf::graph::Surface *g_fillTex, *g_frameTex;  // held for good
 paf::ui::Widget* g_glass[3];                  // the dark's halves and the frame (valid while g_screenAlive)
 
