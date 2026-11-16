@@ -431,6 +431,7 @@ struct Want {
 Want g_req;
 volatile int g_reqSeq;
 Want g_reqLast;  // the music thread's: the song asked for last
+volatile SceInt64 g_reqAt;  // when it was asked for
 
 // While the music thread waits on the music service: since when. As the Vita
 // wakes from sleep the service takes seconds to answer.
@@ -485,6 +486,7 @@ void pollMusic() {
         copyStr(g_reqLast.title, g_track.title, 256);
         copyStr(g_reqLast.album, g_track.album, 256);
         copyStr(g_reqLast.artist, g_track.artist, 256);
+        g_reqAt = sceKernelGetProcessTimeWide();
         g_reqSeq++;
         __sync_synchronize();
         sceClibMemcpy(&g_req, &g_reqLast, sizeof(g_req));
@@ -532,6 +534,7 @@ struct CoverMail {
     SceUID uid;
     const uint8_t* data;
     uint32_t size;
+    int seq;  // the request it answers
 };
 CoverMail g_mail;
 volatile int g_mailSeq, g_mailTaken;
@@ -807,12 +810,13 @@ uint32_t wantKey(const Want& w) {
 
 // g_path (n long) and the folders in it, three deep: true when the song's
 // file is found (its tag in g_tag, its path in g_path).
+volatile int g_searchFor;  // the request being looked for: the search stops when another comes
 bool scanDir(const Want& w, int n, int depth) {
     const SceUID d = sceIoDopen(g_path);
     if (d < 0) return false;
     SceIoDirent e;
     bool hit = false;
-    while (!hit && sceIoDread(d, &e) > 0) {
+    while (!hit && g_reqSeq == g_searchFor && sceIoDread(d, &e) > 0) {
         int len = 0;
         while (e.d_name[len]) len++;
         if (!len || e.d_name[0] == '.' || n + 1 + len >= (int)sizeof(g_path)) continue;
@@ -922,7 +926,10 @@ SceInt64 threadCpuTime() {
 // without an album). A file holds the path, size and time of the song it came
 // from (that song changed or gone, the cover is made again) and the small
 // PNG. The oldest go once there are more than kSavedMax. Covers saved by
-// 1.0.x (".ssc", one a song) are deleted as they are come across.
+// 1.0.x (".ssc", one a song) are deleted as they are come across. An album
+// whose cover can't be shown (none, or one that can't be read: a progressive
+// JPEG, say) is kept too, as a file with no PNG, so its songs show the
+// no-cover square at once instead of being looked for again.
 #define COVER_DIR "ux0:data/startscreenmusic/covers"
 #define COVER_EXT ".cov"
 const int kSavedMax = 300;  // about 13 MB
@@ -1002,7 +1009,7 @@ bool songStat(const char* path, uint64_t& size, uint64_t& time) {
 bool savedHeadFresh(SceUID fd, SavedHead& h, uint32_t cap) {
     char song[256];
     if (!(sceIoRead(fd, &h, sizeof(h)) == (int)sizeof(h) && !sceClibMemcmp(h.magic, kSavedMagic, 4) &&
-          h.pngSize >= 8 && h.pngSize <= cap && h.pathLen > 0 && h.pathLen < sizeof(song) &&
+          (h.pngSize == 0 || (h.pngSize >= 8 && h.pngSize <= cap)) && h.pathLen > 0 && h.pathLen < sizeof(song) &&
           sceIoRead(fd, song, h.pathLen) == (int)h.pathLen))
         return false;
     song[h.pathLen] = 0;
@@ -1021,7 +1028,8 @@ bool savedFresh(const char* name) {
     return fresh;
 }
 
-// w's saved cover into m: true when there is one and its song is unchanged.
+// w's saved cover into m: true when there is one and its song is unchanged
+// (m.kind COVER_NONE: the album has no cover that can be shown).
 bool loadSaved(const Want& w, CoverMail& m, uint32_t cap) {
     char name[96];
     savedName(w, name, sizeof(name));
@@ -1029,6 +1037,11 @@ bool loadSaved(const Want& w, CoverMail& m, uint32_t cap) {
     if (fd < 0) return false;
     SavedHead h;
     bool stale = !savedHeadFresh(fd, h, cap);
+    if (!stale && !h.pngSize) {
+        sceIoClose(fd);
+        m.kind = COVER_NONE;
+        return true;
+    }
     uint8_t* png = NULL;
     SceUID uid = -1;
     if (!stale) {
@@ -1072,7 +1085,7 @@ int pruneSaved() {
             sceIoRemove(path);
             continue;
         }
-        if (sceClibStrcmp(e.d_name + len - 4, COVER_EXT)) continue;
+        if (sceClibStrcmp(e.d_name + len - 4, COVER_EXT) || e.d_stat.st_size < 1024) continue;  // not a cover
         count++;
         const uint64_t t = when(e.d_stat.st_mtime);
         int slot = olds < 32 ? olds++ : -1;
@@ -1128,7 +1141,8 @@ void saveCoverAs(const char* name, const char* songPath, const uint8_t* png, uin
     const SceUID fd = sceIoOpen(temp, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0666);
     if (fd < 0) return;
     const bool ok = sceIoWrite(fd, &h, sizeof(h)) == (int)sizeof(h) &&
-                    sceIoWrite(fd, songPath, h.pathLen) == (int)h.pathLen && sceIoWrite(fd, png, size) == (int)size;
+                    sceIoWrite(fd, songPath, h.pathLen) == (int)h.pathLen &&
+                    (!size || sceIoWrite(fd, png, size) == (int)size);
     sceIoClose(fd);
     if (ok) {
         sceIoRemove(name);
@@ -1224,8 +1238,9 @@ CoverMail findCover(const Want& w) {
     {
         const SceInt64 t = sceKernelGetProcessTimeWide();
         if (loadSaved(w, m, pngSize(kCoverSide, kCoverSide, 3))) {
-            logLine("song \"%s\": cover saved earlier (%d ms)", w.title,
-                    (int)(sceKernelGetProcessTimeWide() - t) / 1000);
+            logLine(m.kind == COVER_NONE ? "song \"%s\": no cover to show, as found earlier (%d ms)"
+                                         : "song \"%s\": cover saved earlier (%d ms)",
+                    w.title, (int)(sceKernelGetProcessTimeWide() - t) / 1000);
             remember(wanted, m.data, m.size);
             return m;
         }
@@ -1254,6 +1269,7 @@ CoverMail findCover(const Want& w) {
         }
     }
     const int ms = (int)(sceKernelGetProcessTimeWide() - t0) / 1000;
+    if (g_reqSeq != g_searchFor) return m;  // another song asked for: dropped
     // One line a song in the log: what its cover came to.
     if (!found) {
         logLine("song \"%s\": not found in ux0:music (%d files, %d ms)", w.title, g_scanned, ms);
@@ -1262,6 +1278,7 @@ CoverMail findCover(const Want& w) {
     if (!g_tag.picSize) {
         logLine("song \"%s\": no cover", w.title);
         remember(wanted, NULL, 0);
+        saveCover(w, g_path, NULL, 0);
         return m;
     }
     SceUID pngUid;
@@ -1276,6 +1293,10 @@ CoverMail findCover(const Want& w) {
             logLine("song \"%s\": cover not read (%s, error %d%s, %d KB free)", w.title, g_smallWhy, ci.error,
                     ci.error == 37 ? ": progressive JPEG" : ci.error == 100 ? ": interlaced PNG" : "",
                     (int)freeUserMemory() >> 10);
+        if (!sceClibStrcmp(g_smallWhy, "picture") || !sceClibStrcmp(g_smallWhy, "too big")) {
+            remember(wanted, NULL, 0);
+            saveCover(w, g_path, NULL, 0);  // it stays so
+        }
         return m;
     }
     logLine("song \"%s\": cover %d x %d (found in %d ms, made small in %d ms, %d ms of it working)", w.title,
@@ -1400,7 +1421,9 @@ void loadJacket() {
 // are made until there are kSavedMax; past that, songs make theirs when they
 // play, as before.
 #define LIBRARY_PATH "ux0:data/startscreenmusic/library.bin"
-const char kLibraryMagic[4] = {'S', 'S', 'M', 'L'};
+// 'SSM2' since 1.1.3: 1.1.2's lists ('SSML') are gone through once more, so
+// albums without a cover that can be shown are kept as such too.
+const char kLibraryMagic[4] = {'S', 'S', 'M', '2'};
 struct LibEntry {
     uint32_t path, size, time;
 };
@@ -1565,14 +1588,16 @@ void passFile(int kind, const SceIoStat& st) {
         list(le);
         return;
     }
-    if (!tag.picSize) {
-        p.none++;
-        list(le);
-        return;
-    }
     char name[96];
     savedNameOf(tag.title, tag.album, tag.artist, name, sizeof(name));
     if (savedFresh(name)) {  // another song of the album made it
+        if (!tag.picSize) p.none++;
+        list(le);
+        return;
+    }
+    if (!tag.picSize) {
+        p.none++;
+        saveCoverAs(name, g_passPath, NULL, 0);
         list(le);
         return;
     }
@@ -1589,8 +1614,10 @@ void passFile(int kind, const SceIoStat& st) {
     if (!pngLen) {
         p.unread++;
         // Short of memory now: tried again next time. A picture that can't
-        // be read stays unread.
+        // be read stays unread, kept so.
         if (sceClibStrcmp(g_smallWhy, "memory")) list(le);
+        if (!sceClibStrcmp(g_smallWhy, "picture") || !sceClibStrcmp(g_smallWhy, "too big"))
+            saveCoverAs(name, g_passPath, NULL, 0);
         return;
     }
     saveCoverAs(name, g_passPath, png, pngLen);
@@ -1681,6 +1708,7 @@ int coverThread(SceSize, void*) {
         done = seq;
         CoverMail m = {COVER_SAME, -1, NULL, 0};
         const bool newAlbum = !w.album[0] || !sameText(w.album, last.album) || !sameText(w.artist, last.artist);
+        g_searchFor = seq;
         if (newAlbum) m = findCover(w);
         // A song skipped while its cover was being looked for: the cover is
         // dropped, so it never shows, and the newer song's is looked for next
@@ -1690,6 +1718,7 @@ int coverThread(SceSize, void*) {
             continue;
         }
         if (newAlbum) last = w;
+        m.seq = seq;
         g_mail = m;
         __sync_synchronize();
         g_mailSeq = seq;
@@ -1777,6 +1806,7 @@ struct UiCover {
     bool pinned;  // PAF kept the file reading it: never freed
 };
 UiCover g_uiCover = {-1, NULL, 0, 0, false, false};
+int g_uiCoverSeq;  // the request g_uiCover answers
 paf::graph::Surface* g_noteTex;  // the row's note, held for good
 paf::graph::SurfacePool* g_pool;  // power_manage_plugin's
 
@@ -1808,6 +1838,7 @@ void takeCover() {
     const int seq = g_mailSeq;
     if (seq == g_mailTaken) return;
     __sync_synchronize();
+    g_uiCoverSeq = g_mail.seq;
     if (g_mail.kind != COVER_SAME) {
         freeUiCover();
         g_uiCover.uid = g_mail.uid;
@@ -1907,7 +1938,10 @@ float g_coverRgb[3] = {1, 1, 1};  // white for a cover; the theme's for the jack
 // What the cover square should show: the song's cover, else Sony's
 // no-cover jacket, else nothing (kShowNote).
 int coverWant() {
-    if (g_uiCover.data && !g_uiCover.failed) return g_uiCover.id;
+    // A new song's cover still being looked for after a second: the last
+    // one's cover isn't kept up meanwhile.
+    const bool behind = g_uiCoverSeq != g_reqSeq && sceKernelGetProcessTimeWide() - g_reqAt > 1000000;
+    if (g_uiCover.data && !g_uiCover.failed && !behind) return g_uiCover.id;
     if (g_jacketReady && !g_jacketFailed) return kShowJacket;
     return kShowNote;
 }
