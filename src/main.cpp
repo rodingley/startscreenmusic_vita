@@ -436,6 +436,8 @@ volatile SceInt64 g_reqAt;  // when it was asked for
 // While the music thread waits on the music service: since when. As the Vita
 // wakes from sleep the service takes seconds to answer.
 volatile SceInt64 g_callSince;
+volatile bool g_slept;  // the Vita slept with the music paused: the Music app sleeps until it is unlocked
+volatile SceInt64 g_asleepAt;  // when the player last said so (10)
 void pollMusic() {
     uint32_t st[0x70 / 4];
     sceClibMemset(st, 0, sizeof(st));
@@ -449,9 +451,24 @@ void pollMusic() {
     Now& n = g_now[g_nowIdx ^ 1];
     // 1 playing, 2 paused. 10 once the Vita has slept with the music paused
     // (seen on 3.65): the Music app, which plays it, sleeps until the Vita is
-    // unlocked, so nothing can play it from the start screen: no panel.
+    // unlocked, so nothing can play it from the start screen: no panel until
+    // the player has said no 10 for 2 seconds (between its 10s, as it wakes,
+    // it says 1 or 2 for a moment). A 10 at any other time (a screenshot
+    // being taken) is only a moment: what the player said before holds.
     const int raw = rcS >= 0 ? (int)st[0x10 / 4] : 0;
-    n.state = raw;
+    const SceInt64 answered = sceKernelGetProcessTimeWide();
+    if (answered - polled > 1000000) {  // over a second to answer: it is waking from sleep
+        if (!g_slept) logLine("music: the Vita slept (%d ms to answer), panel off until the Music app wakes",
+                              (int)((answered - polled) / 1000));
+        g_slept = true;
+        g_asleepAt = answered;
+    }
+    if (raw == 10 && g_slept) g_asleepAt = answered;
+    if (g_slept && raw != 10 && answered - g_asleepAt > 2000000) {
+        g_slept = false;
+        logLine("music: the Music app is awake again");
+    }
+    n.state = raw != 10 ? raw : g_slept ? 10 : was.state;
     // The song (6 KB from the service) only when the player has one.
     int rcT = -1;
     sceClibMemset(&g_track, 0, sizeof(g_track));
@@ -463,12 +480,7 @@ void pollMusic() {
     // LiveArea is open, the app running or not, wherever the music was
     // started. Closing the LiveArea stops the music and the row goes; it
     // comes back when the LiveArea opens again.
-    // Waking, the player can say 1 or 2 for a moment between its 10s: the
-    // panel waits until it has said no 10 for 2 seconds.
-    static SceInt64 asleepAt;
-    if (raw == 10) asleepAt = polled;
-    const bool awake = !asleepAt || polled - asleepAt > 2000000;
-    n.shown = n.loaded && awake && (n.state == 1 || g_musicLiveArea || !g_liveAreaWatched);
+    n.shown = n.loaded && !g_slept && (n.state == 1 || g_musicLiveArea || !g_liveAreaWatched);
     if (was.loaded && !n.loaded) {  // the player has no song now
         g_forgetCovers = true;
         wake(g_wakeCover);
@@ -2295,11 +2307,11 @@ void applyMusic() {
 }
 
 // ── The glass ───────────────────────────────────────────────────────────────
-// Behind the panel, so it reads on any wallpaper: Sony's own 3x3 textures
-// from power_manage_plugin, stretched as Sony stretches them. The edge: the
-// frame Sony draws round the start screen's notifications, its light edge at
-// 24% white. The dark: Sony's filled box made for that frame, 2 pixels
-// inside it, its corners following the frame's, in black at 30%. PAF draws
+// Behind the panel, so it reads on any wallpaper: Sony's own 3x3 textures,
+// stretched as Sony stretches them. The edge: the home screen's soft glass
+// rim (applauncher_plugin), white fading inward over 8 pixels, round the
+// dark. The dark: the filled box Sony made for the frame round the start
+// screen's notifications (power_manage_plugin), in black at 50%. PAF draws
 // only that box's top corners right (it is 44 texels in a texture 48 wide;
 // its bottom ones come out square), so the dark is two halves of it, the
 // lower one turned round: four top corners. (A picture of the whole dark,
@@ -2308,14 +2320,17 @@ void applyMusic() {
 // over the start screen's picture, under the panel's buttons, which keep
 // their touches.
 const uint32_t kPlateTemplate = 0x1FF37238;  // a quick menu row (hidden) and its divider
-const uint32_t kFillTex = 0x3982F37E, kFrameTex = 0xE1E2F764;
-// Round the panel with 9 pixels to spare at the sides, 10 at the top and
-// bottom.
-const float kGlassSide = 9, kGlassEnd = 10;
+const uint32_t kFillTex = 0x3982F37E;
+const uint32_t kRimTex = 0xD8CDFAE1;  // applauncher_plugin's: clear for its first 5 pixels
+const float kRimSpill = 5;
+// Round the panel so its edge is 8 pixels from what is inside on every side
+// (the cover is at the panel's left and top; the volume icon ends a pixel
+// in from its right, the buttons a pixel up from its bottom).
+const float kGlassLeft = 10, kGlassRight = 9, kGlassTop = 10, kGlassBottom = 11;
 const float kFillInset = 2;
 const float kGlassDark = 0.50f;  // the dark's alpha: half, so the lines read on bright wallpapers too
-paf::graph::Surface *g_fillTex, *g_frameTex;  // held for good
-paf::ui::Widget* g_glass[3];                  // the dark's halves and the frame (valid while g_screenAlive)
+paf::graph::Surface *g_fillTex, *g_rimTex;  // held for good
+paf::ui::Widget* g_glass[3];                  // the dark's halves and the edge (valid while g_screenAlive)
 
 struct PlaneAccess : paf::ui::Plane {
     paf::graph::PlaneObj* obj() const { return m_planeobj; }
@@ -2465,7 +2480,7 @@ void addPanel(paf::ui::Widget* page) {
         if (power) g_pool = *(paf::graph::SurfacePool* const*)((const char*)power + 0xD4);
     }
     if (power && !g_fillTex) g_fillTex = pluginTexture(power, kFillTex);
-    if (power && !g_frameTex) g_frameTex = pluginTexture(power, kFrameTex);
+    if (!g_rimTex) g_rimTex = pluginTexture(((PluginFindFn)g_paf[PAF_FIND].fn)("applauncher_plugin"), kRimTex);
     placePanel(page);
     // Into the clock's group (full screen, centred like the page), so it
     // fades with the date and time on a peel. The glass and the song's time
@@ -2482,15 +2497,19 @@ void addPanel(paf::ui::Widget* page) {
         paf::ui::Widget* w = findChild(heading, id);
         return w ? w : findChild(controls, id);
     };
-    const float left = g_panelLeft - kGlassSide, top = g_panelTop - kGlassEnd,
-                right = g_panelLeft + kPanelWidth + kGlassSide, bottom = g_panelTop + kPanelHeight + kGlassEnd,
-                middle = (top + bottom) / 2;
+    const float left = g_panelLeft - kGlassLeft, top = g_panelTop - kGlassTop,
+                right = g_panelLeft + kPanelWidth + kGlassRight, bottom = g_panelTop + kPanelHeight + kGlassBottom,
+                middle = (float)(int)((top + bottom) / 2);  // on a whole pixel
     dressGlass(0, g_fillTex, left + kFillInset, top + kFillInset, right - kFillInset, middle, false, 0, 0, 0,
                kGlassDark);
     dressGlass(1, g_fillTex, left + kFillInset, middle, right - kFillInset, bottom - kFillInset, true, 0, 0, 0,
                kGlassDark);
-    dressGlass(2, g_frameTex, left, top, right, bottom, false, 1, 1, 1, 0.24f);
-    if (!g_fillTex || !g_frameTex) logLine("glass: textures %s %s", g_fillTex ? "fill" : "-", g_frameTex ? "frame" : "-");
+    const float rim = kFillInset - kRimSpill;
+    dressGlass(2, g_rimTex, left + rim, top + rim, right - rim, bottom - rim, false, 1, 1, 1, 1);
+    static bool told;
+    if (!told || !g_fillTex || !g_rimTex)
+        logLine("glass: %s, %s", g_fillTex ? "dark" : "no dark", g_rimTex ? "glass rim" : "no edge");
+    told = true;
 
     // Layout, in quick-menu units from the panel's top left: the cover 150
     // square at the top left (the row's note plane, centred at 75, 75);
@@ -2704,6 +2723,11 @@ void tick(void*) {
         // slept, and what the panel showed may be gone. It goes now, and
         // comes back when the service says so.
         const SceInt64 since = g_callSince;
+        if (since && t - since > 1000000) {
+            if (!g_slept) logLine("music: the Vita slept (no answer yet), panel off until the Music app wakes");
+            g_slept = true;
+            g_asleepAt = t;
+        }
         if (since && t - since > 1000000 && g_panelShown) {
             for (int i = 0; i < 4; i++)
                 if (g_groups[i]) show(g_groups[i], false);

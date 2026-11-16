@@ -7,7 +7,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "toolchain")
 endif()
 
-project(StartScreenMusic VERSION 1.1.3 LANGUAGES C CXX ASM)
+project(StartScreenMusic VERSION 1.1.4 LANGUAGES C CXX ASM)
 include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 add_executable(startscreenmusic src/main.cpp src/cover_image.cpp src/updater.cpp third_party/picojpeg/picojpeg.c

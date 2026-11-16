@@ -11,7 +11,7 @@ Everything on it is Sony's, read from the Vita while it runs; nothing of Sony's 
 - the buttons, icons, volume bar and text styles: the Quick Menu's Music row (`vs0:vsh/shell/impose_plugin.rco`), in the system font;
 - "Unknown" for a song without a title or artist: the Quick Menu's own string, in all 20 of the Vita's languages;
 - the square for a song without a cover: the Music app's own (`vs0:app/NPXS10009/musicbrowser_plugin.rco`);
-- the glass behind it: the frame Sony draws round the start screen's notifications and the filled box made for it, both from `vs0:vsh/shell/power_manage_plugin.rco`;
+- the glass behind it: the home screen's soft glass edge (`vs0:vsh/shell/applauncher_plugin.rco`) round the filled box Sony made for the start screen's notifications (`vs0:vsh/shell/power_manage_plugin.rco`);
 - the song's time: played / length, as the Music app shows it;
 - the layout: the start screen's own margins (the cover's left edge on the speaker line, and 16 px from the edge: the gap the clock keeps), and the theme's clock colour.
 
